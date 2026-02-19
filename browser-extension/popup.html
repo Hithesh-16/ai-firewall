@@ -1,0 +1,155 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AI Firewall</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { width: 360px; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0f172a; color: #e2e8f0; }
+
+    .header { padding: 14px 16px; display: flex; align-items: center; gap: 10px; border-bottom: 1px solid #1e293b; }
+    .header svg { width: 22px; height: 22px; color: #60a5fa; }
+    .header h1 { font-size: 15px; font-weight: 600; flex: 1; }
+    .header .version { font-size: 10px; color: #64748b; }
+
+    .status-bar { padding: 10px 16px; display: flex; align-items: center; gap: 8px; font-size: 13px; border-bottom: 1px solid #1e293b; }
+    .dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+    .dot.ok { background: #22c55e; box-shadow: 0 0 6px #22c55e88; }
+    .dot.err { background: #ef4444; box-shadow: 0 0 6px #ef444488; }
+
+    .tabs { display: flex; border-bottom: 1px solid #1e293b; }
+    .tab { flex: 1; padding: 10px 8px; text-align: center; cursor: pointer; background: none; border: none; color: #64748b; font-size: 11px; font-weight: 500; font-family: inherit; text-transform: uppercase; letter-spacing: 0.5px; border-bottom: 2px solid transparent; transition: all 0.15s; }
+    .tab:hover { color: #94a3b8; }
+    .tab.active { color: #e2e8f0; border-bottom-color: #3b82f6; }
+
+    .panel { display: none; }
+    .panel.active { display: block; }
+
+    .stats-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; padding: 12px 16px; }
+    .stat-card { background: #1e293b; border-radius: 8px; padding: 12px 8px; text-align: center; }
+    .stat-card.block { border-left: 3px solid #ef4444; }
+    .stat-card.redact { border-left: 3px solid #eab308; }
+    .stat-card.allow { border-left: 3px solid #22c55e; }
+    .stat-value { font-size: 20px; font-weight: 700; }
+    .stat-label { font-size: 9px; color: #94a3b8; margin-top: 2px; text-transform: uppercase; letter-spacing: 0.3px; }
+
+    .summary-row { display: flex; justify-content: space-around; padding: 8px 16px; border-top: 1px solid #1e293b; }
+    .summary-item { text-align: center; }
+    .summary-val { font-size: 14px; font-weight: 600; }
+    .summary-label { font-size: 9px; color: #64748b; text-transform: uppercase; }
+
+    .section-title { padding: 10px 16px 6px; font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; color: #64748b; }
+
+    .activity-list { max-height: 250px; overflow-y: auto; }
+    .activity-item { display: flex; align-items: flex-start; gap: 10px; padding: 10px 16px; border-bottom: 1px solid #1e293b66; }
+    .activity-item:hover { background: #1e293b44; }
+    .activity-badge { flex-shrink: 0; width: 8px; height: 8px; border-radius: 50%; margin-top: 5px; }
+    .activity-badge.block { background: #ef4444; }
+    .activity-badge.redact { background: #eab308; }
+    .activity-badge.allow { background: #22c55e; }
+    .activity-badge.offline { background: #6b7280; }
+    .activity-body { flex: 1; min-width: 0; }
+    .activity-source { font-size: 12px; font-weight: 500; }
+    .activity-detail { font-size: 10px; color: #94a3b8; margin-top: 1px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .activity-time { font-size: 10px; color: #64748b; flex-shrink: 0; margin-top: 2px; }
+
+    .empty-state { text-align: center; color: #64748b; padding: 30px 16px; font-size: 12px; }
+
+    .settings-form { padding: 16px; }
+    .form-group { margin-bottom: 14px; }
+    .form-group label { display: block; font-size: 11px; color: #94a3b8; margin-bottom: 4px; }
+    .form-group input { width: 100%; padding: 8px 10px; background: #1e293b; color: #e2e8f0; border: 1px solid #334155; border-radius: 6px; font-family: inherit; font-size: 12px; }
+    .form-group input:focus { outline: none; border-color: #3b82f6; }
+
+    .btn-row { display: flex; gap: 8px; margin-top: 16px; }
+    .btn { padding: 8px 14px; border: none; border-radius: 6px; font-size: 12px; font-family: inherit; cursor: pointer; font-weight: 500; }
+    .btn-primary { background: #3b82f6; color: #fff; }
+    .btn-primary:hover { background: #2563eb; }
+    .btn-danger { background: #1e293b; color: #ef4444; border: 1px solid #334155; }
+    .btn-danger:hover { background: #ef444420; }
+
+    .footer { padding: 10px 16px; border-top: 1px solid #1e293b; text-align: center; font-size: 11px; color: #64748b; }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
+      <path d="M9 12l2 2 4-4"/>
+    </svg>
+    <h1>AI Firewall</h1>
+    <span class="version">v0.2.0</span>
+  </div>
+
+  <div class="status-bar" id="status-bar">
+    <div class="dot" id="status-dot"></div>
+    <span id="status-text">Checking proxy...</span>
+  </div>
+
+  <div class="tabs">
+    <button class="tab active" data-tab="dashboard">Dashboard</button>
+    <button class="tab" data-tab="activity">Activity</button>
+    <button class="tab" data-tab="settings">Settings</button>
+  </div>
+
+  <!-- Dashboard -->
+  <div class="panel active" id="panel-dashboard">
+    <div class="stats-grid">
+      <div class="stat-card block">
+        <div class="stat-value" id="stat-blocked">0</div>
+        <div class="stat-label">Blocked</div>
+      </div>
+      <div class="stat-card redact">
+        <div class="stat-value" id="stat-redacted">0</div>
+        <div class="stat-label">Redacted</div>
+      </div>
+      <div class="stat-card allow">
+        <div class="stat-value" id="stat-allowed">0</div>
+        <div class="stat-label">Allowed</div>
+      </div>
+    </div>
+    <div class="summary-row">
+      <div class="summary-item">
+        <div class="summary-val" id="stat-total">0</div>
+        <div class="summary-label">Total Scanned</div>
+      </div>
+      <div class="summary-item">
+        <div class="summary-val" id="stat-secrets">0</div>
+        <div class="summary-label">Secrets Found</div>
+      </div>
+      <div class="summary-item">
+        <div class="summary-val" id="stat-pii">0</div>
+        <div class="summary-label">PII Found</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Activity -->
+  <div class="panel" id="panel-activity">
+    <div class="activity-list" id="activity-list">
+      <div class="empty-state">No activity yet.<br/>Visit an AI chat site to start monitoring.</div>
+    </div>
+  </div>
+
+  <!-- Settings -->
+  <div class="panel" id="panel-settings">
+    <div class="settings-form">
+      <div class="form-group">
+        <label>Proxy Server URL</label>
+        <input type="url" id="proxy-url" placeholder="http://localhost:8080" />
+      </div>
+      <div class="btn-row">
+        <button class="btn btn-primary" id="save-settings">Save Settings</button>
+        <button class="btn btn-danger" id="clear-stats">Clear All Stats</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="footer">
+    Protecting your AI interactions locally
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

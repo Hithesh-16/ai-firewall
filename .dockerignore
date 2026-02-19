@@ -1,0 +1,8 @@
+node_modules
+dist
+*.db
+data/
+.env
+.git
+*.vsix
+.vscode-test

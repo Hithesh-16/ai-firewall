@@ -1,0 +1,55 @@
+{
+  "version": "1.1",
+  "rules": {
+    "block_private_keys": true,
+    "block_aws_keys": true,
+    "block_db_urls": true,
+    "block_github_tokens": true,
+    "redact_emails": true,
+    "redact_phone": true,
+    "redact_jwt": true,
+    "redact_generic_api_keys": true,
+    "allow_source_code": true,
+    "log_all_requests": true
+  },
+  "file_scope": {
+    "mode": "blocklist",
+    "blocklist": [
+      ".env",
+      ".env.*",
+      "**/*.pem",
+      "**/*.key",
+      "**/secrets/**",
+      "**/credentials/**",
+      "**/config/production.*",
+      "**/.git/**",
+      "**/node_modules/**",
+      "**/dist/**",
+      "**/.aifirewall-vault/**"
+    ],
+    "allowlist": [],
+    "max_file_size_kb": 500,
+    "scan_on_open": false,
+    "scan_on_send": true
+  },
+  "blocked_paths": [
+    "/payments/",
+    "/auth/",
+    "/internal/",
+    "/.env"
+  ],
+  "severity_threshold": "medium",
+  "smart_routing": {
+    "enabled": false,
+    "routes": [
+      { "condition": "risk_score >= 70", "target": "local_llm" },
+      { "condition": "risk_score >= 30", "target": "cloud_redacted" },
+      { "condition": "default", "target": "cloud_direct" }
+    ],
+    "local_llm": {
+      "provider": "ollama",
+      "model": "llama3",
+      "endpoint": "http://localhost:11434"
+    }
+  }
+}

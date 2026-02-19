@@ -1,0 +1,227 @@
+{
+  "name": "ai-firewall",
+  "displayName": "AI Firewall",
+  "description": "Secure AI coding assistant — BYOK, multi-model, inline completions, credit control, pre-flight cost estimation",
+  "version": "0.2.0",
+  "publisher": "ai-firewall",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Machine Learning",
+    "Programming Languages",
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "ai-firewall",
+          "title": "AI Firewall",
+          "icon": "resources/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "ai-firewall": [
+        {
+          "type": "webview",
+          "id": "aiFirewall.chatView",
+          "name": "AI Firewall"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "aiFirewall.openChat",
+        "title": "AI Firewall: Open Chat"
+      },
+      {
+        "command": "aiFirewall.addProvider",
+        "title": "AI Firewall: Add Provider"
+      },
+      {
+        "command": "aiFirewall.selectModel",
+        "title": "AI Firewall: Select Model"
+      },
+      {
+        "command": "aiFirewall.showCreditStatus",
+        "title": "AI Firewall: Show Credit Status"
+      },
+      {
+        "command": "aiFirewall.explainCode",
+        "title": "AI Firewall: Explain This Code"
+      },
+      {
+        "command": "aiFirewall.refactorCode",
+        "title": "AI Firewall: Refactor This Code"
+      },
+      {
+        "command": "aiFirewall.documentCode",
+        "title": "AI Firewall: Add Documentation"
+      },
+      {
+        "command": "aiFirewall.fixCode",
+        "title": "AI Firewall: Fix This Code"
+      },
+      {
+        "command": "aiFirewall.generateTests",
+        "title": "AI Firewall: Generate Tests"
+      },
+      {
+        "command": "aiFirewall.inlineChat",
+        "title": "AI Firewall: Inline Chat (Edit with AI)"
+      },
+      {
+        "command": "aiFirewall.inlineEdit",
+        "title": "AI Firewall: Inline Edit Selection"
+      },
+      {
+        "command": "aiFirewall.toggleInlineCompletions",
+        "title": "AI Firewall: Toggle Inline Completions"
+      },
+      {
+        "command": "aiFirewall.insertCode",
+        "title": "AI Firewall: Insert Code at Cursor"
+      },
+      {
+        "command": "aiFirewall.replaceSelection",
+        "title": "AI Firewall: Replace Selection with Code"
+      },
+      {
+        "command": "aiFirewall.copyCode",
+        "title": "AI Firewall: Copy Code to Clipboard"
+      },
+      {
+        "command": "aiFirewall.viewDashboard",
+        "title": "AI Firewall: View Dashboard"
+      },
+      {
+        "command": "aiFirewall.viewLogs",
+        "title": "AI Firewall: View Logs"
+      },
+      {
+        "command": "aiFirewall.toggleScanning",
+        "title": "AI Firewall: Toggle Scanning"
+      },
+      {
+        "command": "aiFirewall.showRiskScore",
+        "title": "AI Firewall: Show Risk Score"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "aiFirewall.inlineChat",
+        "key": "ctrl+i",
+        "mac": "cmd+i",
+        "when": "editorTextFocus"
+      },
+      {
+        "command": "aiFirewall.openChat",
+        "key": "ctrl+shift+a",
+        "mac": "cmd+shift+a"
+      },
+      {
+        "command": "aiFirewall.toggleInlineCompletions",
+        "key": "ctrl+shift+i",
+        "mac": "cmd+shift+i"
+      }
+    ],
+    "menus": {
+      "editor/context": [
+        {
+          "command": "aiFirewall.inlineChat",
+          "group": "ai-firewall@0"
+        },
+        {
+          "command": "aiFirewall.explainCode",
+          "when": "editorHasSelection",
+          "group": "ai-firewall@1"
+        },
+        {
+          "command": "aiFirewall.refactorCode",
+          "when": "editorHasSelection",
+          "group": "ai-firewall@2"
+        },
+        {
+          "command": "aiFirewall.documentCode",
+          "when": "editorHasSelection",
+          "group": "ai-firewall@3"
+        },
+        {
+          "command": "aiFirewall.fixCode",
+          "when": "editorHasSelection",
+          "group": "ai-firewall@4"
+        },
+        {
+          "command": "aiFirewall.generateTests",
+          "when": "editorHasSelection",
+          "group": "ai-firewall@5"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "AI Firewall",
+      "properties": {
+        "aiFirewall.proxyUrl": {
+          "type": "string",
+          "default": "http://localhost:8080",
+          "description": "URL of the AI Firewall proxy server"
+        },
+        "aiFirewall.defaultModel": {
+          "type": "string",
+          "default": "gpt-4",
+          "description": "Default model for chat and context menu actions"
+        },
+        "aiFirewall.completionModel": {
+          "type": "string",
+          "default": "",
+          "description": "Model for inline completions (leave empty to use defaultModel). Use a fast model like gpt-3.5-turbo for speed."
+        },
+        "aiFirewall.inlineCompletions": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable inline code completions (ghost text as you type, Tab to accept)"
+        },
+        "aiFirewall.completionDelay": {
+          "type": "number",
+          "default": 300,
+          "minimum": 100,
+          "maximum": 2000,
+          "description": "Delay in milliseconds before triggering inline completion (lower = faster but more API calls)"
+        },
+        "aiFirewall.showPreFlight": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show pre-flight cost estimation before sending chat requests"
+        },
+        "aiFirewall.autoRedact": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically redact detected secrets and PII"
+        },
+        "aiFirewall.codeLens": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show inline CodeLens annotations above lines containing detected secrets"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "build": "node esbuild.js",
+    "watch": "node esbuild.js --watch",
+    "typecheck": "tsc --noEmit",
+    "package": "vsce package"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/vscode": "^1.85.0",
+    "esbuild": "^0.24.0",
+    "typescript": "^5.9.2"
+  }
+}

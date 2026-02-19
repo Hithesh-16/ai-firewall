@@ -1,0 +1,33 @@
+version: "3.8"
+
+services:
+  ai-firewall:
+    build: .
+    ports:
+      - "8080:8080"
+    volumes:
+      - firewall-data:/app/data
+    environment:
+      - PORT=8080
+      - DB_PATH=/app/data/firewall.db
+      - MASTER_KEY=${MASTER_KEY:-change-me-in-production}
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 3s
+      start_period: 5s
+
+  ollama:
+    image: ollama/ollama:latest
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama-data:/root/.ollama
+    profiles:
+      - local-llm
+    restart: unless-stopped
+
+volumes:
+  firewall-data:
+  ollama-data:
