@@ -1,0 +1,77 @@
+name: AI Firewall Scan
+
+on:
+  pull_request:
+    branches: [main, master]
+  push:
+    branches: [main, master]
+
+jobs:
+  scan:
+    name: Scan for AI-leakable content
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install proxy dependencies
+        working-directory: ai-firewall/proxy
+        run: npm ci
+
+      - name: Build proxy
+        working-directory: ai-firewall/proxy
+        run: npm run build
+
+      - name: Start proxy in background
+        working-directory: ai-firewall/proxy
+        run: |
+          cp .env.example .env 2>/dev/null || true
+          echo "MASTER_KEY=ci-test-key-$(date +%s)" >> .env
+          node dist/server.js &
+          sleep 3
+
+      - name: Run CLI scan on changed files
+        working-directory: ai-firewall/cli
+        run: |
+          npm ci
+          npm run build
+          node dist/index.js scan ../.. --report
+
+      - name: Check proxy health
+        run: |
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8080/health)
+          if [ "$STATUS" != "200" ]; then
+            echo "Proxy health check failed"
+            exit 1
+          fi
+
+      - name: Scan PR diff for secrets
+        if: github.event_name == 'pull_request'
+        run: |
+          git diff origin/${{ github.base_ref }}...HEAD --name-only --diff-filter=ACM | while read -r FILE; do
+            if [ -f "$FILE" ]; then
+              CONTENT=$(cat "$FILE")
+              RESPONSE=$(curl -s -X POST http://localhost:8080/api/browser-scan \
+                -H "Content-Type: application/json" \
+                -d "$(jq -n --arg text "$CONTENT" --arg source "github-action" --arg url "$FILE" \
+                '{text: $text, source: $source, url: $url}')")
+              ACTION=$(echo "$RESPONSE" | jq -r '.action')
+              if [ "$ACTION" = "BLOCK" ]; then
+                REASONS=$(echo "$RESPONSE" | jq -r '.reasons | join(", ")')
+                echo "::error file=$FILE::AI Firewall BLOCKED: $REASONS"
+                BLOCKED=1
+              elif [ "$ACTION" = "REDACT" ]; then
+                REASONS=$(echo "$RESPONSE" | jq -r '.reasons | join(", ")')
+                echo "::warning file=$FILE::AI Firewall: contains redactable data - $REASONS"
+              fi
+            fi
+          done
+
+          if [ "${BLOCKED:-0}" = "1" ]; then
+            echo "::error::Secrets detected in PR — review flagged files"
+            exit 1
+          fi

@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+# AI Firewall Pre-Commit Hook
+# Scans staged files for secrets and PII before allowing commit.
+# Install: cp hooks/pre-commit .git/hooks/pre-commit && chmod +x .git/hooks/pre-commit
+
+set -e
+
+PROXY_URL="${AI_FIREWALL_URL:-http://localhost:8080}"
+
+RED='\033[0;31m'
+YELLOW='\033[0;33m'
+GREEN='\033[0;32m'
+NC='\033[0m'
+
+echo -e "${GREEN}[AI Firewall]${NC} Scanning staged files for secrets..."
+
+STAGED_FILES=$(git diff --cached --name-only --diff-filter=ACM)
+
+if [ -z "$STAGED_FILES" ]; then
+  echo -e "${GREEN}[AI Firewall]${NC} No staged files to scan."
+  exit 0
+fi
+
+BLOCK_COUNT=0
+REDACT_COUNT=0
+TOTAL=0
+
+for FILE in $STAGED_FILES; do
+  if [ ! -f "$FILE" ]; then
+    continue
+  fi
+
+  CONTENT=$(git show ":$FILE" 2>/dev/null || true)
+  if [ -z "$CONTENT" ]; then
+    continue
+  fi
+
+  TOTAL=$((TOTAL + 1))
+
+  RESPONSE=$(curl -s -w "\n%{http_code}" -X POST "$PROXY_URL/api/browser-scan" \
+    -H "Content-Type: application/json" \
+    -d "$(jq -n --arg text "$CONTENT" --arg source "pre-commit" --arg url "$FILE" \
+    '{text: $text, source: $source, url: $url}')" 2>/dev/null || echo "000")
+
+  HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+  BODY=$(echo "$RESPONSE" | sed '$d')
+
+  if [ "$HTTP_CODE" = "000" ]; then
+    echo -e "${YELLOW}[AI Firewall]${NC} Proxy unreachable — skipping scan"
+    exit 0
+  fi
+
+  ACTION=$(echo "$BODY" | jq -r '.action // "ALLOW"' 2>/dev/null || echo "ALLOW")
+  SECRETS=$(echo "$BODY" | jq -r '.secretsFound // 0' 2>/dev/null || echo "0")
+  PII=$(echo "$BODY" | jq -r '.piiFound // 0' 2>/dev/null || echo "0")
+
+  if [ "$ACTION" = "BLOCK" ]; then
+    REASONS=$(echo "$BODY" | jq -r '.reasons // [] | join(", ")' 2>/dev/null || echo "")
+    echo -e "${RED}[BLOCKED]${NC} $FILE — $REASONS (secrets: $SECRETS, PII: $PII)"
+    BLOCK_COUNT=$((BLOCK_COUNT + 1))
+  elif [ "$ACTION" = "REDACT" ]; then
+    echo -e "${YELLOW}[WARN]${NC} $FILE — contains redactable data (secrets: $SECRETS, PII: $PII)"
+    REDACT_COUNT=$((REDACT_COUNT + 1))
+  fi
+done
+
+echo -e "${GREEN}[AI Firewall]${NC} Scanned $TOTAL files: $BLOCK_COUNT blocked, $REDACT_COUNT warnings"
+
+if [ "$BLOCK_COUNT" -gt 0 ]; then
+  echo -e "${RED}[AI Firewall]${NC} Commit blocked — remove secrets before committing."
+  echo -e "${RED}[AI Firewall]${NC} Use 'git diff --cached' to review staged changes."
+  exit 1
+fi
+
+exit 0
