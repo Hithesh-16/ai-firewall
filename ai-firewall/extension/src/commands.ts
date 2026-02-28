@@ -139,6 +139,54 @@ export function registerCommands(
           "Could not fetch risk score — is the proxy running?"
         );
       }
+    }),
+
+    vscode.commands.registerCommand("aiFirewall.scanExtensions", async () => {
+      const config = vscode.workspace.getConfiguration("aiFirewall");
+      const proxyUrl = config.get<string>("proxyUrl", "http://localhost:8080");
+
+      const plugins = vscode.extensions.all
+        .filter((ext) => !ext.id.startsWith("vscode."))
+        .map((ext) => ({
+          name: ext.id,
+          publisher: ext.id.split(".")[0],
+          version: ext.packageJSON?.version,
+          permissions: ext.packageJSON?.permissions,
+          activationEvents: ext.packageJSON?.activationEvents,
+          capabilities: ext.packageJSON?.capabilities
+        }));
+
+      try {
+        const res = await fetch(`${proxyUrl}/api/plugin-scan`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ plugins })
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = (await res.json()) as {
+          total: number;
+          highRiskCount: number;
+          results: Array<{ name: string; riskScore: number; flags: Array<{ description: string }> }>;
+        };
+
+        if (data.highRiskCount === 0) {
+          vscode.window.showInformationMessage(
+            `AI Firewall: Scanned ${data.total} extensions — no high-risk extensions found.`
+          );
+        } else {
+          const risky = data.results
+            .filter((r) => r.riskScore >= 50)
+            .map((r) => `${r.name} (score: ${r.riskScore})`)
+            .join("\n");
+          vscode.window.showWarningMessage(
+            `AI Firewall: ${data.highRiskCount} high-risk extensions found:\n${risky}`
+          );
+        }
+      } catch {
+        vscode.window.showWarningMessage(
+          "Could not scan extensions — is the proxy running?"
+        );
+      }
     })
   );
 }

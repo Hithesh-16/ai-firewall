@@ -11,7 +11,8 @@ const envSchema = z.object({
   PROVIDER_URL: z.string().url().default("https://api.openai.com/v1/chat/completions"),
   OPENAI_API_KEY: z.string().optional(),
   DB_PATH: z.string().default("./data/firewall.db"),
-  MASTER_KEY: z.string().min(1).optional()
+  MASTER_KEY: z.string().min(1).optional(),
+  STRICT_LOCAL: z.coerce.boolean().default(false)
 });
 
 const parsedEnv = envSchema.safeParse(process.env);
@@ -27,6 +28,16 @@ export function loadPolicyConfig(): PolicyConfig {
   const raw = fs.readFileSync(POLICY_PATH, "utf-8");
   const parsed = JSON.parse(raw) as PolicyConfig;
   return parsed;
+}
+
+export function isStrictLocal(): boolean {
+  if (env.STRICT_LOCAL) return true;
+  try {
+    const policy = loadPolicyConfig();
+    return !!policy.strict_local;
+  } catch {
+    return false;
+  }
 }
 
 export function savePolicyConfig(policy: PolicyConfig): void {

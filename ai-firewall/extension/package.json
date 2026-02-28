@@ -111,6 +111,10 @@
       {
         "command": "aiFirewall.showRiskScore",
         "title": "AI Firewall: Show Risk Score"
+      },
+      {
+        "command": "aiFirewall.scanExtensions",
+        "title": "AI Firewall: Scan Installed Extensions"
       }
     ],
     "keybindings": [

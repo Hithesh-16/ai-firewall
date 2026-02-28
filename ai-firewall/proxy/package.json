@@ -8,6 +8,7 @@
     "dev": "nodemon --watch src --ext ts --exec ts-node src/server.ts",
     "build": "tsc -p tsconfig.json",
     "start": "node dist/server.js",
+    "test:unit": "ts-node src/test/run-tests.ts",
     "typecheck": "tsc --noEmit -p tsconfig.json"
   },
   "dependencies": {
@@ -16,6 +17,7 @@
     "better-sqlite3": "^12.4.1",
     "dotenv": "^17.2.3",
     "fastify": "^5.6.1",
+    "@fastify/static": "^6.1.0",
     "picomatch": "^4.0.3",
     "zod": "^4.1.11"
   },

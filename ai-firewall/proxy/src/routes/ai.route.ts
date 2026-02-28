@@ -2,7 +2,7 @@ import crypto from "node:crypto";
 import axios from "axios";
 import { FastifyInstance } from "fastify";
 import { z } from "zod";
-import { loadPolicyConfig } from "../config";
+import { loadPolicyConfig, isStrictLocal } from "../config";
 import { consumeCredit } from "../gateway/creditService";
 import {
   extractTokenUsage,
@@ -25,6 +25,10 @@ import {
 } from "../router/smartRouter";
 import { scanPII } from "../scanner/piiScanner";
 import { scanSecrets } from "../scanner/secretScanner";
+import { scanEntropy } from "../scanner/entropyScanner";
+import { adjustSeverity } from "../scanner/contextScanner";
+import { scanPromptInjection } from "../scanner/promptInjectionScanner";
+import { evaluateModelPolicy } from "../policy/modelPolicy";
 import { validateFilePaths } from "../scope/fileScope";
 import { ChatCompletionRequest } from "../types";
 
@@ -87,7 +91,57 @@ export async function registerAiRoute(app: FastifyInstance): Promise<void> {
 
     const secretResult = scanSecrets(rawText);
     const piiResult = scanPII(rawText);
+
+    // Entropy-based detection: merge HIGH_ENTROPY matches into secretResult
+    const entropyMatches = scanEntropy(rawText);
+    if (entropyMatches.length > 0) {
+      secretResult.secrets.push(...entropyMatches);
+      secretResult.hasSecrets = secretResult.secrets.length > 0;
+    }
+
+    // Context-aware severity adjustments (based on file paths / placeholders)
+    const contextReasons: string[] = [];
+    const filePaths = payload.metadata?.filePaths;
+
+    for (const s of secretResult.secrets) {
+      try {
+        const adj = adjustSeverity(s.value, s.type, s.severity, filePaths);
+        if (adj && adj.adjustedSeverity && adj.adjustedSeverity !== s.severity) {
+          s.severity = adj.adjustedSeverity;
+          contextReasons.push(`${adj.reason} (${s.type})`);
+        }
+      } catch (e) {
+        // ignore context adjustment errors
+      }
+    }
+
+    for (const p of piiResult.pii) {
+      try {
+        const adj = adjustSeverity(p.value, p.type, p.severity, filePaths);
+        if (adj && adj.adjustedSeverity && adj.adjustedSeverity !== p.severity) {
+          p.severity = adj.adjustedSeverity;
+          contextReasons.push(`${adj.reason} (${p.type})`);
+        }
+      } catch (e) {
+        // ignore
+      }
+    }
+
     const decision = evaluatePolicy(secretResult, piiResult, policy, fileScopeResults);
+    if (contextReasons.length > 0) {
+      decision.reasons = [...new Set([...(decision.reasons ?? []), ...contextReasons])];
+    }
+
+    // Prompt-injection detection
+    const piConfig = policy.prompt_injection;
+    if (piConfig?.enabled !== false) {
+      const piResult = scanPromptInjection(rawText, piConfig?.threshold ?? 60);
+      if (piResult.isInjection) {
+        decision.action = "BLOCK";
+        decision.riskScore = Math.max(decision.riskScore, piResult.score);
+        decision.reasons.push(`Prompt injection detected (score: ${piResult.score})`);
+      }
+    }
 
     // --- BLOCK ---
     if (decision.action === "BLOCK") {
@@ -147,6 +201,19 @@ export async function registerAiRoute(app: FastifyInstance): Promise<void> {
       }));
     }
 
+    // Per-model policy enforcement
+    const modelPolicies = policy.model_policies;
+    if (modelPolicies) {
+      const mpResult = evaluateModelPolicy(payload.model, payload.metadata?.filePaths, modelPolicies);
+      if (!mpResult.allowed) {
+        return reply.status(403).send({
+          error: mpResult.reason,
+          code: "MODEL_POLICY_BLOCKED",
+          blockedFiles: mpResult.blockedFiles
+        });
+      }
+    }
+
     // === GATEWAY PATH: provider is registered in Phase 4 system ===
     if (gatewayRoute) {
       if (!gatewayRoute.creditCheck.allowed) {
@@ -167,18 +234,30 @@ export async function registerAiRoute(app: FastifyInstance): Promise<void> {
         let rawResponseData: Record<string, unknown>;
         let normalizedData: Record<string, unknown>;
 
+        const wantsStream =
+          (request.headers.accept as string | undefined)?.includes("text/event-stream") ||
+          (request.body as any)?.stream === true;
+
         if (gatewayRoute.isLocal) {
           requestPayload = formatOllamaPayload(
             gatewayRoute.model.modelName,
             outboundMessages
           );
-          const resp = await axios.post(
-            gatewayRoute.providerUrl,
-            requestPayload,
-            { headers, timeout: 120_000 }
-          );
-          rawResponseData = resp.data as Record<string, unknown>;
-          normalizedData = normalizeOllamaResponse(rawResponseData) as Record<string, unknown>;
+          if (wantsStream) {
+            // Stream from local Ollama and pipe to client
+            const resp = await axios.post(gatewayRoute.providerUrl, requestPayload, {
+              headers,
+              responseType: "stream",
+              timeout: 0
+            });
+            reply.raw.writeHead(resp.status, resp.headers as any);
+            (resp.data as any).pipe(reply.raw);
+            return reply;
+          } else {
+            const resp = await axios.post(gatewayRoute.providerUrl, requestPayload, { headers, timeout: 120_000 });
+            rawResponseData = resp.data as Record<string, unknown>;
+            normalizedData = normalizeOllamaResponse(rawResponseData) as Record<string, unknown>;
+          }
         } else if (isAnthropicProvider(providerSlug)) {
           requestPayload = formatAnthropicPayload(
             gatewayRoute.model.modelName,
@@ -186,32 +265,49 @@ export async function registerAiRoute(app: FastifyInstance): Promise<void> {
           );
           headers["x-api-key"] = gatewayRoute.decryptedKey;
           headers["anthropic-version"] = "2023-06-01";
-          const resp = await axios.post(
-            gatewayRoute.providerUrl,
-            requestPayload,
-            { headers }
-          );
-          rawResponseData = resp.data as Record<string, unknown>;
-          normalizedData = normalizeAnthropicResponse(rawResponseData) as Record<string, unknown>;
+          if (wantsStream) {
+            const resp = await axios.post(gatewayRoute.providerUrl, requestPayload, {
+              headers,
+              responseType: "stream",
+              timeout: 0
+            });
+            reply.raw.writeHead(resp.status, resp.headers as any);
+            (resp.data as any).pipe(reply.raw);
+            return reply;
+          } else {
+            const resp = await axios.post(gatewayRoute.providerUrl, requestPayload, { headers });
+            rawResponseData = resp.data as Record<string, unknown>;
+            normalizedData = normalizeAnthropicResponse(rawResponseData) as Record<string, unknown>;
+          }
         } else if (isGeminiProvider(providerSlug)) {
           requestPayload = formatGeminiPayload(outboundMessages);
           const url = `${gatewayRoute.providerUrl}?key=${gatewayRoute.decryptedKey}`;
-          const resp = await axios.post(url, requestPayload, { headers });
-          rawResponseData = resp.data as Record<string, unknown>;
-          normalizedData = normalizeGeminiResponse(rawResponseData) as Record<string, unknown>;
+          if (wantsStream) {
+            const resp = await axios.post(url, requestPayload, { headers, responseType: "stream", timeout: 0 });
+            reply.raw.writeHead(resp.status, resp.headers as any);
+            (resp.data as any).pipe(reply.raw);
+            return reply;
+          } else {
+            const resp = await axios.post(url, requestPayload, { headers });
+            rawResponseData = resp.data as Record<string, unknown>;
+            normalizedData = normalizeGeminiResponse(rawResponseData) as Record<string, unknown>;
+          }
         } else {
           requestPayload = {
             model: gatewayRoute.model.modelName,
             messages: outboundMessages
           };
           headers["Authorization"] = `Bearer ${gatewayRoute.decryptedKey}`;
-          const resp = await axios.post(
-            gatewayRoute.providerUrl,
-            requestPayload,
-            { headers }
-          );
-          rawResponseData = resp.data as Record<string, unknown>;
-          normalizedData = rawResponseData;
+          if (wantsStream) {
+            const resp = await axios.post(gatewayRoute.providerUrl, requestPayload, { headers, responseType: "stream", timeout: 0 });
+            reply.raw.writeHead(resp.status, resp.headers as any);
+            (resp.data as any).pipe(reply.raw);
+            return reply;
+          } else {
+            const resp = await axios.post(gatewayRoute.providerUrl, requestPayload, { headers });
+            rawResponseData = resp.data as Record<string, unknown>;
+            normalizedData = rawResponseData;
+          }
         }
 
         const elapsed = Date.now() - startedAt;
@@ -297,6 +393,14 @@ export async function registerAiRoute(app: FastifyInstance): Promise<void> {
           details: message
         });
       }
+    }
+
+    // STRICT_LOCAL: if no local gateway route was found and strict_local is on, block
+    if (isStrictLocal()) {
+      return reply.status(403).send({
+        error: "STRICT_LOCAL mode is enabled — only local LLM providers are allowed. No local provider found for this model.",
+        code: "STRICT_LOCAL_ENFORCED"
+      });
     }
 
     // === LEGACY PATH: no gateway provider found — use Phase 1-2 env-based routing ===

@@ -59,9 +59,31 @@ export async function registerStatsRoute(app: FastifyInstance): Promise<void> {
       WHERE timestamp > ?
     `).get(Date.now() - 7 * 24 * 60 * 60 * 1000) as { avg: number; max: number };
 
-    const score = Math.round(100 - row.avg);
+    // riskScore: higher means riskier (use avg risk_score from logs)
+    const riskScore = Math.round(row.avg);
+
+    // Build a breakdown from logged reasons
+    const reasonRows = db.prepare(`
+      SELECT reasons
+      FROM logs
+      WHERE reasons IS NOT NULL AND reasons != '[]'
+    `).all() as Array<{ reasons: string }>;
+
+    const breakdown: Record<string, number> = {};
+    for (const r of reasonRows) {
+      try {
+        const parsed = JSON.parse(r.reasons) as string[];
+        for (const reason of parsed) {
+          breakdown[reason] = (breakdown[reason] ?? 0) + 1;
+        }
+      } catch {
+        continue;
+      }
+    }
+
     return {
-      projectSafetyScore: Math.max(0, Math.min(100, score)),
+      riskScore,
+      breakdown,
       avgRiskScore: Math.round(row.avg * 100) / 100,
       maxRiskScore: row.max,
       period: "7d"

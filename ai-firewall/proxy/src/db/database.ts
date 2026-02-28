@@ -128,6 +128,33 @@ CREATE TABLE IF NOT EXISTS usage_logs (
 
 CREATE INDEX IF NOT EXISTS idx_usage_provider ON usage_logs(provider_id);
 CREATE INDEX IF NOT EXISTS idx_usage_timestamp ON usage_logs(timestamp);
+ 
+-- Admin audit actions (resolves, purges, admin interventions)
+CREATE TABLE IF NOT EXISTS admin_audit (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  timestamp INTEGER NOT NULL,
+  user_id INTEGER,
+  action TEXT NOT NULL,
+  details TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_admin_audit_user ON admin_audit(user_id);
+
+-- Audit queue for privacy review (Phase X)
+CREATE TABLE IF NOT EXISTS audit_queue (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  created_at INTEGER NOT NULL,
+  submitter_id INTEGER,
+  snippet_masked TEXT NOT NULL,
+  metadata TEXT,
+  blindmi_score REAL DEFAULT 0,
+  github_hits INTEGER DEFAULT 0,
+  status TEXT DEFAULT 'pending',
+  reviewer_id INTEGER,
+  reviewed_at INTEGER,
+  action TEXT,
+  notes TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_audit_queue_status ON audit_queue(status);
 `);
 
 export default db;

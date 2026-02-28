@@ -1,5 +1,5 @@
 import axios from "axios";
-import { env } from "../config";
+import { env, isStrictLocal } from "../config";
 import { PolicyConfig, RouteDecision, SmartRoutingConfig } from "../types";
 
 const DEFAULT_ROUTING: SmartRoutingConfig = {
@@ -56,6 +56,17 @@ export function resolveRoute(
   policy: PolicyConfig
 ): RouteDecision {
   const routing = policy.smart_routing ?? DEFAULT_ROUTING;
+
+  // STRICT_LOCAL: always route to local LLM
+  if (isStrictLocal()) {
+    return {
+      target: "local_llm",
+      providerUrl: ollamaCompletionUrl(routing),
+      model: routing.local_llm.model,
+      requiresRedaction: false,
+      isLocal: true
+    };
+  }
 
   if (!routing.enabled) {
     return {

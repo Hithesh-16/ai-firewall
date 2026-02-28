@@ -1,4 +1,4 @@
-import { env } from "../config";
+import { env, isStrictLocal } from "../config";
 import { GatewayRouteDecision, Model, Provider } from "../types";
 import { checkCredit } from "./creditService";
 import { findModelByName } from "./modelService";
@@ -39,6 +39,11 @@ export function resolveGatewayRoute(requestedModel: string): GatewayRouteDecisio
 
   const provider = getProviderById(model.providerId);
   if (!provider || !provider.enabled || !model.enabled) return null;
+
+  // STRICT_LOCAL: reject cloud providers
+  if (isStrictLocal() && !isLocalProvider(provider)) {
+    return null;
+  }
 
   const creditResult = checkCredit(provider.id, model.id);
 

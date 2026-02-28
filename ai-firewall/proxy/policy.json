@@ -1,5 +1,6 @@
 {
-  "version": "1.1",
+  "version": "1.2",
+  "strict_local": false,
   "rules": {
     "block_private_keys": true,
     "block_aws_keys": true,
@@ -51,5 +52,19 @@
       "model": "llama3",
       "endpoint": "http://localhost:11434"
     }
+  }
+,
+  "model_policies": {
+    "default": { "allowed_paths": ["**"], "blocked_paths": [] }
+  },
+  "prompt_injection": {
+    "enabled": true,
+    "threshold": 60
+  },
+  "audit": {
+    "enabled": false,
+    "privacyRiskThreshold": 0.5,
+    "githubHitThreshold": 50,
+    "useSurrogateModel": true
   }
 }

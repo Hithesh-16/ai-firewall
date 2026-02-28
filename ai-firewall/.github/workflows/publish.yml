@@ -1,0 +1,28 @@
+name: Publish Artifacts (dry-run)
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+jobs:
+  build-and-package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Build proxy
+        working-directory: proxy
+        run: npm ci && npm run build
+      - name: Build extension
+        working-directory: extension
+        run: npm ci && npm run build
+      - name: Build dashboard
+        working-directory: dashboard
+        run: npm ci && npm run build
+      - name: Package Docker image (dry-run)
+        run: echo \"Docker image build would occur here (dry-run)\"
+

@@ -1,0 +1,20 @@
+<idea-plugin>
+  <id>ai.firewall.plugin</id>
+  <name>AI Firewall</name>
+  <vendor email="dev@aifirewall.local">AI Firewall</vendor>
+  <version>0.1.0</version>
+  <description>AI Firewall JetBrains plugin skeleton — provides completions and a chat toolwindow that talks to local proxy.</description>
+
+  <depends>com.intellij.modules.platform</depends>
+
+  <extensions defaultExtensionNs="com.intellij">
+    <!-- Extensions will be registered by Kotlin classes -->
+  </extensions>
+
+  <actions>
+    <group id="AI.Firewall.Group" text="AI Firewall" description="AI Firewall actions">
+      <action id="AI.Firewall.OpenChat" class="ai.firewall.plugin.actions.OpenChatAction" text="Open AI Firewall Chat"/>
+    </group>
+  </actions>
+</idea-plugin>
+

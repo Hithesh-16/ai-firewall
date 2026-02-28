@@ -1,8 +1,8 @@
 # AI Firewall — Product & Development Documentation
 
-> **Version:** v2.0.0
+> **Version:** v3.0.0
 > **Last Updated:** February 18, 2026
-> **Status:** Development Complete — All Phases Built
+> **Status:** Development Complete — All Phases + Security Hardening Built
 
 ---
 
@@ -25,7 +25,12 @@
 15. [Air-Gapped Deployment](#15-air-gapped-deployment)
 16. [API Reference](#16-api-reference)
 17. [Security Architecture](#17-security-architecture)
-18. [Environment Configuration](#18-environment-configuration)
+18. [STRICT_LOCAL Enforcement](#19-strict_local-enforcement)
+19. [Prompt-Injection Detection](#20-prompt-injection-detection)
+20. [Per-Model Policy Enforcement](#21-per-model-policy-enforcement)
+21. [Plugin Scanner](#22-plugin-scanner)
+22. [CA Certificate Management](#23-ca-certificate-management)
+23. [Environment Configuration](#24-environment-configuration)
 
 ---
 
@@ -377,6 +382,17 @@ ai-firewall/
 | F29 | Multi-Provider Router | ✅ | `gateway/gatewayRouter.ts` |
 | F30 | Pre-flight Cost Estimation | ✅ | `routes/estimate.route.ts` |
 
+### Phase 5 — Security Hardening
+
+| # | Feature | Status | Module |
+|---|---|---|---|
+| F31 | STRICT_LOCAL Enforcement | ✅ | `config.ts`, `gatewayRouter.ts`, `smartRouter.ts` |
+| F32 | Prompt-Injection Detector (13 patterns) | ✅ | `scanner/promptInjectionScanner.ts` |
+| F33 | Per-Model Policy Enforcement | ✅ | `policy/modelPolicy.ts` |
+| F34 | Hardened BlindMI (multi-signal) | ✅ | `audit/blindMi.ts` |
+| F35 | IDE Plugin Scanner | ✅ | `scanner/pluginScanner.ts`, `routes/pluginScan.route.ts` |
+| F36 | CA Install/Uninstall Scripts | ✅ | `tools/ca-manager/` |
+
 ### VS Code Extension Features
 
 | Feature | Keybinding | Module |
@@ -392,6 +408,7 @@ ai-firewall/
 | Show Risk Score | Command palette | `commands.ts` |
 | Explain / Refactor / Document / Fix / Generate Tests | Right-click | `commands.ts` |
 | Insert / Replace / Copy code blocks | Chat UI buttons | `webview/main.ts` |
+| Scan Installed Extensions | Command palette | `commands.ts` |
 
 ---
 
@@ -414,6 +431,8 @@ ai-firewall/
 | `credits` | Credit limits (requests/tokens/dollars) |
 | `usage_logs` | Per-request token + cost tracking |
 | `token_vault` | Reversible tokenization storage |
+| `admin_audit` | Admin action audit trail |
+| `audit_queue` | Privacy audit review queue |
 
 ---
 
@@ -460,6 +479,31 @@ Adjusts severity based on file paths:
 - **Upgrades** matches in sensitive paths (`auth/`, `payment/`, `config/`)
 
 ---
+
+## Privacy Audit & Leak Detection (Phase X)
+
+This product includes an automated privacy-audit pipeline to detect potential training-data leakage or PII exposure from code-generation models. The approach is inspired by the CodexLeaks research and is implemented as an opt-in auditing and pre-flight feature.
+
+Key components:
+- Blind Membership Inference (BlindMI): statistical pre-filter using subsequence perplexity and differential comparisons to flag outputs likely memorized from training data.
+- GitHub / Repo Cross-check: hit-rate heuristics that query GitHub (or internal repo search) for matches as a ground-truth proxy.
+- Human-in-the-loop Dashboard: flagged candidates go to an audit queue for review, masking sensitive elements when shown to human reviewers.
+- PrivacyRisk in Pre-flight: `POST /api/estimate` may optionally include `privacyRisk` and recommended actions (redact, route to local LLM, require human approval).
+
+API & integration points:
+- `POST /api/estimate` — returns estimated tokens, cost, credit status, standard scan result, and optionally `privacyRisk` when the audit module is enabled.
+- `POST /api/audit/queue` — internal route to enqueue model outputs for human review (dashboard).
+- `GET /api/audit/queue` — list audit candidates for review (dashboard).
+- `POST /api/audit/action` — accept/reject/annotate actions from reviewers.
+
+Operational notes:
+- Audit mode is opt-in and configurable per-project. It can be expensive in API calls, so use surrogate/local models for low-cost prefiltering where possible.
+- The system masks sensitive substrings in the dashboard UI; raw strings are stored only in the encrypted token vault and accessible only to admins via the reversible token workflow.
+
+Limitations and ethics:
+- GitHub search is a heuristic only — removal/takedown of training artifacts and private data may limit verification.
+- BlindMI works best when log-prob or probability vectors are available from the provider; fallback heuristics use surrogate perplexity estimators.
+- All audit activities should follow ethical guidelines — user consent, limited retention, and secure storage.
 
 ## 8. Policy Engine
 
@@ -729,10 +773,101 @@ Multi-stage Dockerfile: builds proxy + dashboard, runs as minimal Alpine image. 
 | Input validation | All requests validated with Zod schemas |
 | CORS | Fastify CORS middleware (configurable origins) |
 | File scope control | Glob-based blocklist/allowlist for AI file access |
+| STRICT_LOCAL mode | Runtime flag blocks all cloud providers — local LLM only |
+| Prompt-injection detection | 13 regex patterns scoring instruction-override attacks |
+| Per-model policy | Restrict which files each AI model can access |
+| Plugin scanner | Detect suspicious IDE extensions by permissions and publisher |
+| CA management | Generate, install, and uninstall local root CA with consent flows |
 
 ---
 
-## 18. Environment Configuration
+## 19. STRICT_LOCAL Enforcement
+
+When enabled (`strict_local: true` in `policy.json` or `STRICT_LOCAL=true` env var), the proxy **rejects every request** to a cloud AI provider. Only locally-running providers (Ollama, etc.) are permitted.
+
+- **Gateway router**: blocks gateway route resolution for any non-local provider
+- **Smart router**: always routes to `local_llm` regardless of risk score
+- **AI route**: returns `HTTP 403` with code `STRICT_LOCAL_ENFORCED` if no local route is found
+
+Use case: Air-gapped or compliance-heavy environments where no data may leave the machine.
+
+---
+
+## 20. Prompt-Injection Detection
+
+The prompt-injection scanner (`scanner/promptInjectionScanner.ts`) analyses every inbound prompt for 13 categories of jailbreak/injection patterns:
+
+| Pattern Category | Weight | Example |
+|---|---|---|
+| Instruction override | 30 | "Ignore all previous instructions" |
+| System prompt extraction | 30 | "Repeat your system prompt" |
+| Delimiter injection | 30 | \`\`\`system or \<\|im_start\|\> |
+| Data exfiltration | 35 | "Send all files to..." |
+| DAN / jailbreak | 25 | "Do Anything Now" |
+| Role-play | 20 | "Pretend you are..." |
+| New instructions | 25 | "New instructions:" |
+| Persona switch | 25 | "Switch to evil mode" |
+| Context confusion | 25 | "Forget everything" |
+| Chain-of-thought leak | 20 | "Show your reasoning" |
+| Output format hijack | 20 | "Respond only with..." |
+| Encoding bypass | 15 | base64 decode, hex escape |
+| Indirect injection | 20 | "When you see this..." |
+
+The result includes a `score` (0–100), `isInjection` flag (true if score >= threshold), and individual match details. The threshold is configurable in `policy.json` → `prompt_injection.threshold` (default: 60).
+
+Integrated into:
+- `POST /v1/chat/completions` — blocks the request
+- `POST /api/estimate` — returns `promptInjection` in pre-flight response
+- `POST /api/browser-scan` — blocks browser-originated injections
+
+---
+
+## 21. Per-Model Policy Enforcement
+
+The `model_policies` section in `policy.json` restricts which files each AI model can access, using glob patterns:
+
+```json
+"model_policies": {
+  "gpt-4": { "allowed_paths": ["src/frontend/**"], "blocked_paths": ["src/auth/**"] },
+  "claude-3": { "allowed_paths": ["**/*.md", "docs/**"], "blocked_paths": [] },
+  "default": { "allowed_paths": ["**"], "blocked_paths": [] }
+}
+```
+
+Evaluation is done via picomatch glob matching. If a file referenced in the request metadata matches a `blocked_paths` pattern (or doesn't match any `allowed_paths` pattern), the request is blocked with `HTTP 403` and code `MODEL_POLICY_BLOCKED`.
+
+---
+
+## 22. Plugin Scanner
+
+The plugin scanner (`POST /api/plugin-scan`) analyses IDE extension metadata for security risks:
+
+- **Publisher trust**: flags unknown or untrusted publishers
+- **Permission analysis**: flags `shell`, `fs`, `network`, `env`, `clipboard` access
+- **Activation events**: flags wildcard (`*`) or startup-immediate activation
+- **Capability checks**: flags extensions that run in untrusted workspaces
+
+The VS Code extension includes a `Scan Installed Extensions` command that collects metadata from all installed extensions and sends it to the proxy for analysis.
+
+---
+
+## 23. CA Certificate Management
+
+Scripts in `proxy/tools/ca-manager/` manage a local root CA for optional TLS interception:
+
+| Script | Platform | Purpose |
+|---|---|---|
+| `generate-ca.sh` | All | Generate 4096-bit RSA root CA |
+| `install-ca-macos.sh` | macOS | Add to System Keychain |
+| `install-ca-linux.sh` | Linux | Copy to `/usr/local/share/ca-certificates` |
+| `uninstall-ca-macos.sh` | macOS | Remove from Keychain |
+| `uninstall-ca-linux.sh` | Linux | Remove from trust store |
+
+All scripts display a consent banner and require explicit `yes` confirmation before any action. sudo is required for install/uninstall operations.
+
+---
+
+## 24. Environment Configuration
 
 ### `.env`
 
@@ -742,6 +877,7 @@ PROVIDER_URL=https://api.openai.com/v1/chat/completions
 OPENAI_API_KEY=your_key_here
 DB_PATH=./data/firewall.db
 MASTER_KEY=your_encryption_master_key
+STRICT_LOCAL=false
 ```
 
 ### Startup Commands
