@@ -8,6 +8,12 @@ import { evaluatePolicy } from "../policy/policyEngine";
 import { mergeProjectPolicy } from "../policy/projectPolicy";
 import { scanPII } from "../scanner/piiScanner";
 import { scanSecrets } from "../scanner/secretScanner";
+import { scanEntropy } from "../scanner/entropyScanner";
+import { adjustSeverity } from "../scanner/contextScanner";
+import { scanPromptInjection } from "../scanner/promptInjectionScanner";
+import { evaluateModelPolicy } from "../policy/modelPolicy";
+import { analyzeBlindMi } from "../audit/blindMi";
+import { githubSearch } from "../tools/githubSearch";
 import { validateFilePaths } from "../scope/fileScope";
 
 const estimateSchema = z.object({
@@ -49,7 +55,86 @@ export async function registerEstimateRoute(app: FastifyInstance): Promise<void>
 
     const secretResult = scanSecrets(rawText);
     const piiResult = scanPII(rawText);
+
+    // Entropy-based detection
+    const entropyMatches = scanEntropy(rawText);
+    if (entropyMatches.length > 0) {
+      secretResult.secrets.push(...entropyMatches);
+      secretResult.hasSecrets = secretResult.secrets.length > 0;
+    }
+
+    // Context adjustments
+    const contextReasons: string[] = [];
+    const filePaths = metadata?.filePaths;
+    for (const s of secretResult.secrets) {
+      try {
+        const adj = adjustSeverity(s.value, s.type, s.severity, filePaths);
+        if (adj && adj.adjustedSeverity && adj.adjustedSeverity !== s.severity) {
+          s.severity = adj.adjustedSeverity;
+          contextReasons.push(`${adj.reason} (${s.type})`);
+        }
+      } catch (e) {}
+    }
+    for (const p of piiResult.pii) {
+      try {
+        const adj = adjustSeverity(p.value, p.type, p.severity, filePaths);
+        if (adj && adj.adjustedSeverity && adj.adjustedSeverity !== p.severity) {
+          p.severity = adj.adjustedSeverity;
+          contextReasons.push(`${adj.reason} (${p.type})`);
+        }
+      } catch (e) {}
+    }
+
     const decision = evaluatePolicy(secretResult, piiResult, policy, fileScopeResults);
+    if (contextReasons.length > 0) {
+      decision.reasons = [...new Set([...(decision.reasons ?? []), ...contextReasons])];
+    }
+
+    // Per-model policy enforcement
+    const modelPolicies = policy.model_policies;
+    let modelPolicyBlocked: { reason?: string; blockedFiles: string[] } | undefined;
+    if (modelPolicies) {
+      const mpResult = evaluateModelPolicy(model, metadata?.filePaths, modelPolicies);
+      if (!mpResult.allowed) {
+        decision.action = "BLOCK";
+        decision.reasons.push(mpResult.reason ?? "Model policy blocked");
+        modelPolicyBlocked = { reason: mpResult.reason, blockedFiles: mpResult.blockedFiles };
+      }
+    }
+
+    // Prompt-injection detection
+    const piConfig = policy.prompt_injection;
+    let promptInjection: { score: number; isInjection: boolean; matches: Array<{ pattern: string; matched: string }> } | undefined;
+    if (piConfig?.enabled !== false) {
+      const piResult = scanPromptInjection(rawText, piConfig?.threshold ?? 60);
+      promptInjection = { score: piResult.score, isInjection: piResult.isInjection, matches: piResult.matches.map(m => ({ pattern: m.pattern, matched: m.matched })) };
+      if (piResult.isInjection) {
+        decision.action = "BLOCK";
+        decision.riskScore = Math.max(decision.riskScore, piResult.score);
+        decision.reasons.push(`Prompt injection detected (score: ${piResult.score})`);
+      }
+    }
+
+    // Optional privacy audit (opt-in)
+    let privacyRisk: { blindMiScore?: number; githubHits?: number; privacyRiskScore?: number } | undefined = undefined;
+    try {
+      if (policy.audit && policy.audit.enabled) {
+        const blind = analyzeBlindMi(rawText);
+        let ghHits = 0;
+        if (policy.audit.useSurrogateModel && blind.blindMiScore >= (policy.audit.privacyRiskThreshold ?? 0.5)) {
+          // perform lightweight GitHub search using first candidate
+          if (blind.candidates.length > 0) {
+            const q = encodeURIComponent(blind.candidates[0]);
+            const gh = await githubSearch(q);
+            ghHits = gh.hitCount ?? 0;
+          }
+        }
+        const combined = Math.min(1, blind.blindMiScore + (ghHits > 0 ? 0.3 : 0));
+        privacyRisk = { blindMiScore: blind.blindMiScore, githubHits: ghHits, privacyRiskScore: Math.round(combined * 100) / 100 };
+      }
+    } catch (e) {
+      // best-effort
+    }
 
     const estimatedInputTokens = estimateTokens(rawText);
 
@@ -83,6 +168,9 @@ export async function registerEstimateRoute(app: FastifyInstance): Promise<void>
         riskScore: decision.riskScore,
         reasons: decision.reasons
       },
+      modelPolicyBlocked,
+      promptInjection,
+      privacyRisk,
       model: {
         name: registeredModel?.modelName ?? model,
         displayName: registeredModel?.displayName ?? model,

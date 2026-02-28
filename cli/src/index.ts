@@ -18,6 +18,8 @@ Usage:
 Options:
   --url <url>    Proxy URL (default: http://localhost:8080)
   --token <tok>  API token for authenticated endpoints
+  --report        Output machine-readable JSON report (useful for CI)
+  --out <path>    Write report JSON to file when used with --report
 
 Environment:
   AIFIREWALL_URL    Proxy URL
@@ -29,6 +31,8 @@ type Args = {
   positional: string;
   url: string;
   token: string;
+  report: boolean;
+  out: string;
 };
 
 function parseArgs(argv: string[]): Args {
@@ -37,6 +41,8 @@ function parseArgs(argv: string[]): Args {
   let token = process.env.AIFIREWALL_TOKEN ?? "";
   let command = "help";
   let positional = "";
+  let report = false;
+  let out = "";
 
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
@@ -44,6 +50,10 @@ function parseArgs(argv: string[]): Args {
       url = args[++i];
     } else if (arg === "--token" && args[i + 1]) {
       token = args[++i];
+    } else if (arg === "--report") {
+      report = true;
+    } else if (arg === "--out" && args[i + 1]) {
+      out = args[++i];
     } else if (!command || command === "help") {
       command = arg;
     } else {
@@ -63,7 +73,7 @@ function parseArgs(argv: string[]): Args {
     }
   }
 
-  return { command, positional, url, token };
+  return { command, positional, url, token, report, out };
 }
 
 function headers(token: string): Record<string, string> {
@@ -84,7 +94,9 @@ async function cmdStatus(url: string): Promise<void> {
   }
 }
 
-async function cmdScan(url: string, dir: string): Promise<void> {
+import fs from "node:fs";
+
+async function cmdScan(url: string, dir: string, report = false, outPath = ""): Promise<void> {
   const targetDir = path.resolve(dir || ".");
   console.log(`Scanning: ${targetDir}\n`);
 
@@ -96,26 +108,39 @@ async function cmdScan(url: string, dir: string): Promise<void> {
     );
 
     const report = res.data;
-    console.log(`=== AI Leak Simulation Report ===\n`);
-    console.log(`Files analyzed:  ${report.filesAnalyzed}`);
-    console.log(`Files excluded:  ${report.filesExcluded}`);
-    console.log(`Overall risk:    ${report.overallRisk.toUpperCase()}\n`);
-
-    if (report.findings.length > 0) {
-      console.log("Findings:");
-      for (const f of report.findings) {
-        const loc = f.line ? `:${f.line}` : "";
-        console.log(`  [${f.severity.toUpperCase()}] ${f.category} — ${f.detail}`);
-        console.log(`          ${f.filePath}${loc}`);
+    if (report) {
+      // Output JSON for CI
+      const json = JSON.stringify(report, null, 2);
+      console.log(json);
+      if (outPath) {
+        try {
+          fs.writeFileSync(outPath, json, "utf-8");
+        } catch (e) {
+          console.error("Failed to write report to file:", e);
+        }
       }
-      console.log();
-    }
+    } else {
+      console.log(`=== AI Leak Simulation Report ===\n`);
+      console.log(`Files analyzed:  ${report.filesAnalyzed}`);
+      console.log(`Files excluded:  ${report.filesExcluded}`);
+      console.log(`Overall risk:    ${report.overallRisk.toUpperCase()}\n`);
 
-    if (report.recommendations.length > 0) {
-      console.log("Recommendations:");
-      report.recommendations.forEach((r: string, i: number) => {
-        console.log(`  ${i + 1}. ${r}`);
-      });
+      if (report.findings.length > 0) {
+        console.log("Findings:");
+        for (const f of report.findings) {
+          const loc = f.line ? `:${f.line}` : "";
+          console.log(`  [${f.severity.toUpperCase()}] ${f.category} — ${f.detail}`);
+          console.log(`          ${f.filePath}${loc}`);
+        }
+        console.log();
+      }
+
+      if (report.recommendations.length > 0) {
+        console.log("Recommendations:");
+        report.recommendations.forEach((r: string, i: number) => {
+          console.log(`  ${i + 1}. ${r}`);
+        });
+      }
     }
   } catch (err) {
     if (axios.isAxiosError(err)) {
@@ -187,14 +212,14 @@ async function cmdExport(url: string, token: string, format: string): Promise<vo
 }
 
 async function main(): Promise<void> {
-  const { command, positional, url, token } = parseArgs(process.argv);
+  const { command, positional, url, token, report, out } = parseArgs(process.argv);
 
   switch (command) {
     case "status":
       await cmdStatus(url);
       break;
     case "scan":
-      await cmdScan(url, positional);
+      await cmdScan(url, positional, report, out);
       break;
     case "stats":
       await cmdStats(url, token);

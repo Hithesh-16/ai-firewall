@@ -45,3 +45,17 @@ export function listLogs(limit = 100, offset = 0): unknown[] {
   `);
   return stmt.all(limit, offset);
 }
+
+export function listLogsPaged(limit = 100, offset = 0): { logs: unknown[]; total: number } {
+  const totalStmt = db.prepare(`SELECT COUNT(*) AS count FROM logs`);
+  const { count } = totalStmt.get() as { count: number };
+  const stmt = db.prepare(`
+    SELECT *
+    FROM logs
+    ORDER BY timestamp DESC
+    LIMIT ?
+    OFFSET ?
+  `);
+  const logs = stmt.all(limit, offset);
+  return { logs, total: count };
+}

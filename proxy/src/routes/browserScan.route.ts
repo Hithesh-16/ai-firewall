@@ -4,6 +4,9 @@ import { evaluatePolicy } from "../policy/policyEngine";
 import { redact } from "../redactor/redactor";
 import { scanPII } from "../scanner/piiScanner";
 import { scanSecrets } from "../scanner/secretScanner";
+import { scanEntropy } from "../scanner/entropyScanner";
+import { adjustSeverity } from "../scanner/contextScanner";
+import { scanPromptInjection } from "../scanner/promptInjectionScanner";
 
 interface BrowserScanBody {
   text: string;
@@ -28,7 +31,52 @@ export async function registerBrowserScanRoute(
       const policy = loadPolicyConfig();
       const secretResult = scanSecrets(text);
       const piiResult = scanPII(text);
+
+      // Entropy detection
+      const entropyMatches = scanEntropy(text);
+      if (entropyMatches.length > 0) {
+        secretResult.secrets.push(...entropyMatches);
+        secretResult.hasSecrets = secretResult.secrets.length > 0;
+      }
+
+      // Context adjustments (no filePaths available in browser-scan; pass undefined)
+      const contextReasons: string[] = [];
+      for (const s of secretResult.secrets) {
+        try {
+          const adj = adjustSeverity(s.value, s.type, s.severity, undefined);
+          if (adj && adj.adjustedSeverity && adj.adjustedSeverity !== s.severity) {
+            s.severity = adj.adjustedSeverity;
+            contextReasons.push(`${adj.reason} (${s.type})`);
+          }
+        } catch (e) {}
+      }
+      for (const p of piiResult.pii) {
+        try {
+          const adj = adjustSeverity(p.value, p.type, p.severity, undefined);
+          if (adj && adj.adjustedSeverity && adj.adjustedSeverity !== p.severity) {
+            p.severity = adj.adjustedSeverity;
+            contextReasons.push(`${adj.reason} (${p.type})`);
+          }
+        } catch (e) {}
+      }
+
       const decision = evaluatePolicy(secretResult, piiResult, policy);
+      if (contextReasons.length > 0) {
+        decision.reasons = [...new Set([...(decision.reasons ?? []), ...contextReasons])];
+      }
+
+      // Prompt-injection detection
+      const piConfig = policy.prompt_injection;
+      let promptInjectionScore = 0;
+      if (piConfig?.enabled !== false) {
+        const piResult = scanPromptInjection(text, piConfig?.threshold ?? 60);
+        promptInjectionScore = piResult.score;
+        if (piResult.isInjection) {
+          decision.action = "BLOCK";
+          decision.riskScore = Math.max(decision.riskScore, piResult.score);
+          decision.reasons.push(`Prompt injection detected (score: ${piResult.score})`);
+        }
+      }
 
       let redactedText: string | undefined;
       if (decision.action === "REDACT") {

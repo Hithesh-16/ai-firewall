@@ -76,6 +76,23 @@ export type FileScopeConfig = {
 
 export type SeverityThreshold = "critical" | "high" | "medium";
 
+export type AuditConfig = {
+  enabled: boolean;
+  privacyRiskThreshold?: number;
+  githubHitThreshold?: number;
+  useSurrogateModel?: boolean;
+};
+
+export type PromptInjectionConfig = {
+  enabled: boolean;
+  threshold?: number;
+};
+
+export type ModelPolicyRule = {
+  allowed_paths: string[];
+  blocked_paths: string[];
+};
+
 export type PolicyConfig = {
   version: string;
   rules: PolicyRules;
@@ -83,6 +100,10 @@ export type PolicyConfig = {
   blocked_paths: string[];
   severity_threshold: SeverityThreshold;
   smart_routing?: SmartRoutingConfig;
+  strict_local?: boolean;
+  model_policies?: Record<string, ModelPolicyRule>;
+  prompt_injection?: PromptInjectionConfig;
+  audit?: AuditConfig;
 };
 
 export type PolicyDecision = {
@@ -293,4 +314,19 @@ export type GatewayRouteDecision = {
   providerUrl: string;
   creditCheck: CreditCheck;
   isLocal: boolean;
+};
+
+// --- Prompt Injection types ---
+
+export type PromptInjectionMatch = {
+  pattern: string;
+  matched: string;
+  position: number;
+  weight: number;
+};
+
+export type PromptInjectionResult = {
+  score: number;
+  isInjection: boolean;
+  matches: PromptInjectionMatch[];
 };

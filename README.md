@@ -23,13 +23,17 @@ Developer Machine
 │  │   ├── Secret Scanner (12 patterns)                   │    │
 │  │   ├── PII Scanner (7 patterns)                       │    │
 │  │   ├── Entropy Scanner (high-entropy detection)       │    │
-│  │   └── Context-Aware Scorer (path-based adjustment)   │    │
+│  │   ├── Context-Aware Scorer (path-based adjustment)   │    │
+│  │   └── Prompt-Injection Detector (13 patterns)        │    │
 │  │                                                      │    │
 │  │  Policy Engine ──► Redaction Engine                   │    │
+│  │  Model Policy  ──► Per-model file access control      │    │
 │  │  Smart Router  ──► Local LLM / Cloud AI              │    │
+│  │  STRICT_LOCAL  ──► Block all cloud (local-only mode) │    │
 │  │  AI Gateway    ──► BYOK Multi-Provider Routing       │    │
 │  │  Credit Manager──► Usage Tracking + Limits           │    │
 │  │  Token Vault   ──► Reversible Tokenization           │    │
+│  │  Plugin Scanner──► IDE extension risk assessment     │    │
 │  │  Logger        ──► SQLite (sanitized audit trail)    │    │
 │  └──────────────────────────────────────────────────────┘    │
 │                              │                               │
@@ -101,6 +105,9 @@ Core interception engine. Runs on `localhost:8080`.
 | `CRUD /api/credits` | Credit limit management |
 | `GET /api/usage/summary` | Usage tracking |
 | `POST /api/vault/resolve` | Reverse tokenization (admin) |
+| `POST /api/plugin-scan` | IDE extension security scanner |
+| `GET /api/audit/queue` | Privacy audit review queue |
+| `POST /api/audit/action` | Audit item actions (approve/redact/block) |
 | `GET /health` | Health check |
 
 ### Dashboard (`dashboard/`)
@@ -162,6 +169,22 @@ The `.github/workflows/ai-firewall-scan.yml` workflow scans PRs for AI-leakable 
 - **Encrypted API key vault** — AES-256-GCM encryption for stored provider keys
 - **Reversible tokenization** — admin-controlled vault for forensic investigation
 - **Input validation** — all requests validated with Zod
+- **STRICT_LOCAL mode** — block all cloud providers at the gateway level (local LLM only)
+- **Prompt-injection detection** — 13 pattern categories block jailbreak / instruction-override attacks
+- **Per-model file policies** — restrict which files each AI model can access
+- **Plugin scanner** — analyse IDE extensions for suspicious permissions and publishers
+- **CA management** — generate/install/uninstall local root CA with explicit consent
+
+## Privacy Audit & Leak Detection (new)
+
+We include a privacy-audit pipeline inspired by recent academic work on memorization and privacy leaks in code-generation models (e.g., CodexLeaks). This feature helps detect potential PII or secret leakage risks before prompts are sent or when auditing model outputs.
+
+- Blind Membership Inference (BlindMI): a pre-filter that flags outputs likely to be memorized by the model using subsequence perplexity and distribution tests.
+- GitHub / Repo Cross-check: optional hit-rate lookup to heuristically validate whether a candidate output matches public repo content.
+- Dashboard Audit Queue: a human-in-the-loop review workflow where flagged outputs are masked, reviewed, and actioned (redact/block/ignore).
+- PrivacyRisk in pre-flight: `/api/estimate` may return a privacyRisk score and remediation suggestions (opt-in).
+
+This audit pipeline is opt-in and configurable; it is intended to augment the scanner, not replace it. See `docs/PRIVACY_AUDIT.md` for full documentation.
 
 ## License
 

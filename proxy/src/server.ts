@@ -1,6 +1,9 @@
 import cors from "@fastify/cors";
 import Fastify from "fastify";
 import { env } from "./config";
+import path from "node:path";
+import fs from "node:fs";
+import fastifyStatic from "@fastify/static";
 import { registerAiRoute } from "./routes/ai.route";
 import { registerAuthRoutes } from "./routes/auth.route";
 import { registerBrowserScanRoute } from "./routes/browserScan.route";
@@ -17,6 +20,8 @@ import { registerProviderRoutes } from "./routes/provider.route";
 import { registerSimulatorRoute } from "./routes/simulator.route";
 import { registerStatsRoute } from "./routes/stats.route";
 import { registerUsageRoutes } from "./routes/usage.route";
+import { registerAuditRoutes } from "./routes/audit.route";
+import { registerPluginScanRoutes } from "./routes/pluginScan.route";
 
 async function bootstrap(): Promise<void> {
   const app = Fastify({
@@ -24,6 +29,20 @@ async function bootstrap(): Promise<void> {
   });
 
   await app.register(cors, { origin: true });
+
+  // Serve dashboard static files when available (air-gapped single-container mode)
+  try {
+    const dashboardDist = path.resolve(__dirname, "../../dashboard/dist");
+    if (fs.existsSync(dashboardDist)) {
+      await app.register(fastifyStatic, {
+        root: dashboardDist,
+        prefix: "/"
+      });
+      app.log.info(`Serving dashboard from ${dashboardDist}`);
+    }
+  } catch (e) {
+    app.log.warn({ err: e }, "Dashboard static serve not available");
+  }
 
   // Public routes
   await registerHealthRoute(app);
@@ -55,6 +74,10 @@ async function bootstrap(): Promise<void> {
 
   // Pre-flight estimation
   await registerEstimateRoute(app);
+
+  // Privacy audit (opt-in, Phase X)
+  await registerAuditRoutes(app);
+  registerPluginScanRoutes(app);
 
   // Core proxy route (auth via API key header or .env)
   await registerAiRoute(app);
