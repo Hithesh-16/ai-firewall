@@ -81,6 +81,27 @@
     "enabled": true,
     "threshold": 60
   },
+  "mcp_proxy": {
+    "enabled": true,
+    "servers": [
+      {
+        "name": "filesystem",
+        "targetUrl": "http://localhost:3001"
+      },
+      {
+        "name": "database",
+        "targetUrl": "http://localhost:3002"
+      },
+      {
+        "name": "git",
+        "targetUrl": "http://localhost:3003"
+      },
+      {
+        "name": "http://localhost:9999",
+        "targetUrl": "http://localhost:9999"
+      }
+    ]
+  },
   "audit": {
     "enabled": false,
     "privacyRiskThreshold": 0.5,

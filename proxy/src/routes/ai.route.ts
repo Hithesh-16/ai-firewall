@@ -32,14 +32,46 @@ import { evaluateModelPolicy } from "../policy/modelPolicy";
 import { validateFilePathsWithRoot } from "../scope/fileScope";
 import { ChatCompletionRequest } from "../types";
 
+// Tool parameter schema — used for MCP tool definitions forwarded to providers
+const toolParameterSchema: z.ZodTypeAny = z.object({
+  type: z.string(),
+  properties: z.record(z.string(), z.any()).optional(),
+  required: z.array(z.string()).optional(),
+  description: z.string().optional()
+}).passthrough();
+
+const toolSchema = z.object({
+  type: z.literal("function").optional(),
+  function: z.object({
+    name: z.string(),
+    description: z.string().optional(),
+    parameters: toolParameterSchema.optional()
+  }).optional(),
+  // Anthropic format: top-level name/description/input_schema
+  name: z.string().optional(),
+  description: z.string().optional(),
+  input_schema: z.any().optional()
+}).passthrough();
+
 const chatSchema = z.object({
   model: z.string(),
   messages: z.array(
     z.object({
       role: z.string(),
-      content: z.string()
-    })
+      // content may be string (normal) or null (when role=assistant with tool_calls)
+      content: z.union([z.string(), z.null()]).optional(),
+      // OpenAI tool_calls in assistant message
+      tool_calls: z.array(z.any()).optional(),
+      // OpenAI tool result message
+      tool_call_id: z.string().optional(),
+      // Anthropic tool_use / tool_result block arrays
+      name: z.string().optional()
+    }).passthrough()
   ),
+  // Pass-through tools so providers receive them unchanged
+  tools: z.array(toolSchema).optional(),
+  tool_choice: z.any().optional(),
+  stream: z.boolean().optional(),
   metadata: z
     .object({
       filePaths: z.array(z.string()).optional(),
@@ -276,6 +308,10 @@ export async function registerAiRoute(app: FastifyInstance): Promise<void> {
           (request.headers.accept as string | undefined)?.includes("text/event-stream") ||
           (request.body as any)?.stream === true;
 
+        // Extract tools from the inbound request (MCP tools forwarded by the extension)
+        const inboundTools = (request.body as any)?.tools as unknown[] | undefined;
+        const inboundToolChoice = (request.body as any)?.tool_choice;
+
         if (gatewayRoute.isLocal) {
           requestPayload = formatOllamaPayload(
             gatewayRoute.model.modelName,
@@ -297,10 +333,19 @@ export async function registerAiRoute(app: FastifyInstance): Promise<void> {
             normalizedData = normalizeOllamaResponse(rawResponseData) as Record<string, unknown>;
           }
         } else if (isAnthropicProvider(providerSlug)) {
-          requestPayload = formatAnthropicPayload(
+          const anthropicBase = formatAnthropicPayload(
             gatewayRoute.model.modelName,
             outboundMessages
-          );
+          ) as Record<string, unknown>;
+          // Convert OpenAI-style tools → Anthropic tool format
+          if (inboundTools && inboundTools.length > 0) {
+            anthropicBase.tools = inboundTools.map((t: any) => ({
+              name: t.function?.name ?? t.name,
+              description: t.function?.description ?? t.description ?? "",
+              input_schema: t.function?.parameters ?? t.input_schema ?? { type: "object", properties: {} }
+            }));
+          }
+          requestPayload = anthropicBase;
           headers["x-api-key"] = gatewayRoute.decryptedKey;
           headers["anthropic-version"] = "2023-06-01";
           if (wantsStream) {
@@ -318,7 +363,18 @@ export async function registerAiRoute(app: FastifyInstance): Promise<void> {
             normalizedData = normalizeAnthropicResponse(rawResponseData) as Record<string, unknown>;
           }
         } else if (isGeminiProvider(providerSlug)) {
-          requestPayload = formatGeminiPayload(outboundMessages);
+          const geminiBase = formatGeminiPayload(outboundMessages) as Record<string, unknown>;
+          // Convert OpenAI-style tools → Gemini functionDeclarations
+          if (inboundTools && inboundTools.length > 0) {
+            geminiBase.tools = [{
+              functionDeclarations: inboundTools.map((t: any) => ({
+                name: t.function?.name ?? t.name,
+                description: t.function?.description ?? t.description ?? "",
+                parameters: t.function?.parameters ?? t.input_schema
+              }))
+            }];
+          }
+          requestPayload = geminiBase;
           const url = `${gatewayRoute.providerUrl}?key=${gatewayRoute.decryptedKey}`;
           if (wantsStream) {
             const resp = await axios.post(url, requestPayload, { headers, responseType: "stream", timeout: 0 });
@@ -331,9 +387,12 @@ export async function registerAiRoute(app: FastifyInstance): Promise<void> {
             normalizedData = normalizeGeminiResponse(rawResponseData) as Record<string, unknown>;
           }
         } else {
+          // OpenAI-compatible: pass tools through directly
           requestPayload = {
             model: gatewayRoute.model.modelName,
-            messages: outboundMessages
+            messages: outboundMessages,
+            ...(inboundTools?.length ? { tools: inboundTools } : {}),
+            ...(inboundToolChoice !== undefined ? { tool_choice: inboundToolChoice } : {})
           };
           headers["Authorization"] = `Bearer ${gatewayRoute.decryptedKey}`;
           if (wantsStream) {

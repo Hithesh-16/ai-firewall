@@ -393,6 +393,17 @@ ai-firewall/
 | F35 | IDE Plugin Scanner | ✅ | `scanner/pluginScanner.ts`, `routes/pluginScan.route.ts` |
 | F36 | CA Install/Uninstall Scripts | ✅ | `tools/ca-manager/` |
 
+### Phase 6 — MCP Security Gateway
+
+| # | Feature | Status | Module |
+|---|---|---|---|
+| F37 | MCP Proxy Gateway (SSE + JSON-RPC intercept) | ✅ | `routes/mcpProxy.route.ts` |
+| F38 | MCP Request Scanner (tools/call arguments) | ✅ | `mcp/mcpScanner.ts` |
+| F39 | MCP Response Scanner (tool result content) | ✅ | `mcp/mcpScanner.ts` |
+| F40 | resources/read File Scope Enforcement | ✅ | `routes/mcpProxy.route.ts` + `scope/fileScope.ts` |
+| F41 | Prompt Injection Detection on Tool Arguments | ✅ | `scanner/promptInjectionScanner.ts` |
+| F42 | Multi-Server Named MCP Config | ✅ | `policy.json` → `mcp_proxy.servers[]` |
+
 ### VS Code Extension Features
 
 | Feature | Keybinding | Module |
@@ -757,6 +768,88 @@ Multi-stage Dockerfile: builds proxy + dashboard, runs as minimal Alpine image. 
 | GET | `/api/export/json` | Export logs as JSON |
 | GET | `/api/export/csv` | Export logs as CSV |
 | GET | `/api/export/compliance` | Compliance summary report |
+
+### MCP Security Gateway
+
+| Method | Endpoint | Description |
+|---|---|---|
+| POST | `/mcp/proxy/messages?server=<name>` | Intercept and scan JSON-RPC MCP messages |
+| GET | `/mcp/proxy/sse?server=<name>` | Proxy SSE session channel to downstream MCP server |
+
+---
+
+## 24. MCP Security Gateway
+
+### What Problem It Solves
+
+Modern AI coding tools (VS Code, Cursor, Claude Desktop) use the **Model Context Protocol (MCP)** to give the LLM access to external tools: filesystem access, database queries, git history, shell commands, and more. Without protection, an LLM can:
+
+- Read `.env` files, private keys, and secrets directly via `resources/read`
+- Exfiltrate credentials through `tools/call` arguments (e.g., passing an AWS key to a db query)
+- Receive PII from database tools and embed it in generated code
+- Be injected with malicious instructions via crafted tool arguments
+
+The AI Firewall MCP Security Gateway sits **between the AI client and all MCP servers**, enforcing the same security policies that protect the chat proxy.
+
+### Architecture
+
+```
+AI Client (VS Code / Cursor / Claude Desktop)
+        │
+        │  SSE session:  GET /mcp/proxy/sse?server=filesystem
+        │  Tool calls:   POST /mcp/proxy/messages?server=filesystem
+        ▼
+┌─────────────────────────────────────────────────────┐
+│          AI Firewall MCP Security Gateway           │
+│                                                     │
+│  ┌──────────────────────────────────────────────┐   │
+│  │  resources/read  → file_scope blocklist check│   │
+│  │  tools/call      → secret + PII scan         │   │
+│  │                  → prompt injection scan      │   │
+│  │  response content→ secret + PII scan         │   │
+│  └──────────────────────────────────────────────┘   │
+└──────────────────────┬──────────────────────────────┘
+                       │
+          ┌────────────┼────────────┐
+          ▼            ▼            ▼
+   filesystem MCP  database MCP   git MCP
+   (port 3001)     (port 3002)    (port 3003)
+```
+
+### Enforcement Layers
+
+| MCP Method | Enforcement |
+|---|---|
+| `resources/read` | URI checked against `file_scope.blocklist` — same rules as VS Code extension. Blocks `.env`, `*.pem`, `secrets/`, etc. |
+| `tools/call` (request) | Arguments scanned for secrets/PII + prompt injection. Blocks or redacts before reaching the tool server. |
+| `tools/call` (response) | Tool result content scanned for secrets/PII. Blocks or redacts before the AI sees the result. |
+| `resources/read` (response) | File content scanned for secrets/PII in the response. |
+| All other methods | Pass-through (session metadata only — no sensitive data). |
+
+### Configuration (`policy.json`)
+
+```json
+"mcp_proxy": {
+  "enabled": true,
+  "servers": [
+    { "name": "filesystem", "targetUrl": "http://localhost:3001" },
+    { "name": "database",   "targetUrl": "http://localhost:3002" },
+    { "name": "git",        "targetUrl": "http://localhost:3003" }
+  ]
+}
+```
+
+- The `server` query parameter (`?server=filesystem`) selects which downstream server to proxy.
+- Omitting `?server=` routes to the first configured server.
+- The `file_scope` blocklist in the same `policy.json` applies to all `resources/read` calls.
+
+### Why Not a Standalone MCP Server?
+
+The firewall acts as a **transparent proxy** (not an MCP server itself) for three reasons:
+
+1. **No key changes required** — existing MCP client configs just point their `targetUrl` at the firewall instead of directly at the tool server.
+2. **BYOK stays intact** — the firewall never touches the LLM API keys; it only intercepts tool traffic.
+3. **Full audit trail** — every blocked/redacted MCP call is logged in SQLite under the same schema as chat completions.
 
 ---
 

@@ -80,8 +80,19 @@ let selectedCatalogModels: Set<string> = new Set();
 let currentPhase = "";
 let currentPhaseLabel = "";
 
-// Typewriter animation state
+// MCP server management state
+type McpServer = { name: string; targetUrl: string; online?: boolean };
+let mcpServers: McpServer[] = [];
+let mcpNewName = "";
+let mcpNewUrl = "";
+
+// Typewriter animation state (used when receiving full response at once)
 let typewriterTimer: ReturnType<typeof setInterval> | null = null;
+
+// Real-streaming state
+let streamingActive = false;
+let streamingAccum = "";      // full text accumulated across all chatChunk messages
+let streamingDiv: HTMLDivElement | null = null;
 
 // ── Rendering ──────────────────────────────────────────────────────────
 
@@ -102,6 +113,7 @@ function render(): void {
         ${renderTab("models", "Models")}
         ${renderTab("credits", "Credits")}
         ${renderTab("activity", "Activity")}
+        ${renderTab("mcp", "MCP")}
       </div>
       <div class="panel ${currentTab === "chat" ? "active" : ""}" id="panel-chat" role="tabpanel" aria-label="Chat">
         ${renderChat()}
@@ -117,6 +129,9 @@ function render(): void {
       </div>
       <div class="panel ${currentTab === "activity" ? "active" : ""}" id="panel-activity" role="tabpanel" aria-label="Activity">
         ${renderActivity()}
+      </div>
+      <div class="panel ${currentTab === "mcp" ? "active" : ""}" id="panel-mcp" role="tabpanel" aria-label="MCP Servers">
+        ${renderMcp()}
       </div>
     ` : `
       <div class="panel active" id="panel-login">
@@ -702,6 +717,58 @@ function renderActivity(): string {
   `;
 }
 
+// ── MCP Server Management ────────────────────────────────────────────────
+
+function renderMcp(): string {
+  const statusDot = (online?: boolean) =>
+    online === true
+      ? `<span style="color:var(--ok);font-size:10px">● online</span>`
+      : online === false
+        ? `<span style="color:var(--err);font-size:10px">● offline</span>`
+        : `<span style="color:var(--subtle);font-size:10px">● unknown</span>`;
+
+  return `
+    <div class="section-title">MCP Servers</div>
+    <div style="font-size:11px;color:var(--subtle);margin-bottom:10px">
+      Model Context Protocol servers provide tools (file I/O, git, database, etc.) to the LLM.
+      All traffic is scanned by the AI Firewall before being forwarded.
+    </div>
+
+    ${mcpServers.length === 0
+      ? `<div class="empty-state" style="margin-bottom:12px">No MCP servers configured. Add one below.</div>`
+      : mcpServers.map((s) => `
+        <div class="card" style="margin-bottom:6px">
+          <div class="card-header">
+            <span class="card-title">${esc(s.name)}</span>
+            ${statusDot(s.online)}
+          </div>
+          <div style="font-size:11px;color:var(--subtle);margin-bottom:6px">${esc(s.targetUrl)}</div>
+          <button type="button" class="btn btn-secondary btn-sm mcp-delete-btn" data-name="${esc(s.name)}">Remove</button>
+        </div>
+      `).join("")}
+
+    <div class="section-title" style="margin-top:14px">Add Server</div>
+    <div class="form-group">
+      <label>Name</label>
+      <input type="text" id="mcp-name-input" placeholder="e.g. filesystem" value="${esc(mcpNewName)}" />
+    </div>
+    <div class="form-group">
+      <label>Target URL</label>
+      <input type="text" id="mcp-url-input" placeholder="http://localhost:3001" value="${esc(mcpNewUrl)}" />
+    </div>
+    <button type="button" class="btn btn-primary" id="mcp-add-btn">Add Server</button>
+
+    <div class="section-title" style="margin-top:18px">What are MCP Servers?</div>
+    <div style="font-size:11px;color:var(--subtle);line-height:1.6">
+      MCP servers run locally and expose tools (read_file, write_file, list_dir, run_query, etc.)
+      that the AI can call to complete tasks — just like Copilot or Cursor.<br><br>
+      <b>BYOK keys are not needed for MCP servers</b> — only LLM providers (OpenAI, Anthropic, etc.) use API keys.
+      MCP servers are local processes that respond to JSON-RPC calls.<br><br>
+      Popular servers: <b>filesystem</b> (file read/write), <b>git</b> (commits, diffs), <b>database</b> (SQL queries).
+    </div>
+  `;
+}
+
 // ── Events ──────────────────────────────────────────────────────────────
 
 function bindEvents(): void {
@@ -726,6 +793,7 @@ function bindEvents(): void {
       if (currentTab === "models") { vscode.postMessage({ type: "loadModels" }); }
       if (currentTab === "credits") { vscode.postMessage({ type: "loadCredits" }); }
       if (currentTab === "activity") { vscode.postMessage({ type: "loadUsage" }); }
+      if (currentTab === "mcp") { vscode.postMessage({ type: "loadMcpServers" }); }
       render();
     });
   });
@@ -889,6 +957,32 @@ function bindEvents(): void {
   });
 
   document.getElementById("clear-chat-btn")?.addEventListener("click", () => clearChat());
+
+  // ── MCP Server management events ──────────────────────────────────────
+  document.getElementById("mcp-add-btn")?.addEventListener("click", () => {
+    const nameEl = document.getElementById("mcp-name-input") as HTMLInputElement | null;
+    const urlEl  = document.getElementById("mcp-url-input")  as HTMLInputElement | null;
+    const name = nameEl?.value.trim() ?? "";
+    const targetUrl = urlEl?.value.trim() ?? "";
+    if (!name || !targetUrl) { return; }
+    mcpNewName = "";
+    mcpNewUrl  = "";
+    vscode.postMessage({ type: "addMcpServer", name, targetUrl });
+  });
+
+  document.getElementById("mcp-name-input")?.addEventListener("input", (e) => {
+    mcpNewName = (e.target as HTMLInputElement).value;
+  });
+  document.getElementById("mcp-url-input")?.addEventListener("input", (e) => {
+    mcpNewUrl = (e.target as HTMLInputElement).value;
+  });
+
+  document.querySelectorAll<HTMLButtonElement>(".mcp-delete-btn").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const name = btn.dataset.name ?? "";
+      if (name) vscode.postMessage({ type: "deleteMcpServer", name });
+    });
+  });
 
   // Image preview remove buttons
   document.querySelectorAll<HTMLButtonElement>(".preview-remove").forEach((btn) => {
@@ -1342,6 +1436,64 @@ window.addEventListener("message", (event) => {
       render();
       break;
 
+    // ── Real streaming: open a new assistant bubble ───────────────────────
+    case "chatStreamStart": {
+      if (typewriterTimer) { clearInterval(typewriterTimer); typewriterTimer = null; }
+      streamingActive = true;
+      streamingAccum = "";
+
+      // Remove phase/typing indicators
+      document.querySelector(".phase-indicator")?.remove();
+      document.querySelector(".typing-indicator")?.remove();
+
+      const msgs = document.getElementById("chat-messages");
+      if (msgs) {
+        streamingDiv = document.createElement("div");
+        streamingDiv.className = "msg assistant";
+        streamingDiv.setAttribute("role", "article");
+        streamingDiv.innerHTML =
+          `<div class="markdown-preview"><span id="stream-text-live" style="white-space:pre-wrap"></span>` +
+          `<span class="stream-cursor" aria-hidden="true">▋</span></div>`;
+        msgs.appendChild(streamingDiv);
+        msgs.scrollTop = msgs.scrollHeight;
+      }
+      break;
+    }
+
+    // ── Real streaming: append incoming delta directly to DOM ─────────────
+    case "chatChunk": {
+      const delta = (msg.text ?? "") as string;
+      streamingAccum += delta;
+      const liveEl = document.getElementById("stream-text-live");
+      if (liveEl) {
+        liveEl.textContent = streamingAccum;
+        const msgs = document.getElementById("chat-messages");
+        if (msgs) msgs.scrollTop = msgs.scrollHeight;
+      }
+      break;
+    }
+
+    // ── Real streaming: finalise bubble with proper markdown ─────────────
+    case "chatStreamDone": {
+      streamingActive = false;
+      isLoading = false;
+
+      if (streamingDiv) {
+        streamingDiv.remove();
+        streamingDiv = null;
+      }
+
+      // Push accumulated content into history and re-render with markdown
+      const finalContent = streamingAccum;
+      streamingAccum = "";
+      if (finalContent) {
+        chatHistory.push({ role: "assistant", content: finalContent });
+      }
+      render();
+      (document.getElementById("chat-input") as HTMLTextAreaElement | null)?.focus();
+      break;
+    }
+
     case "chatResponse": {
       currentPhase = "done";
       currentPhaseLabel = "";
@@ -1375,11 +1527,29 @@ window.addEventListener("message", (event) => {
           chatHistory.push({ role: "system", content: `↳ Sent with redaction (${fw.secrets_found ?? 0} secrets, ${fw.pii_found ?? 0} PII removed)` });
         }
       }
-      const content = resp.choices?.[0]?.message?.content ?? "(no response)";
-      const modelUsed = fw?.model_used ?? selectedModel;
-      // Typewriter animation: progressively shows text then renders final markdown
-      isLoading = false;
-      startTypewriter(content, modelUsed);
+
+      // If streaming already rendered the content, just append metadata note
+      if (fw?.model_used) {
+        // Avoid re-pushing if chatStreamDone already pushed the content
+        const lastMsg = chatHistory[chatHistory.length - 1];
+        const alreadyStreamed = lastMsg?.role === "assistant" &&
+          resp.choices?.[0]?.message?.content &&
+          lastMsg.content === resp.choices[0].message.content;
+
+        if (!alreadyStreamed) {
+          const content = resp.choices?.[0]?.message?.content ?? "(no response)";
+          isLoading = false;
+          startTypewriter(content, fw.model_used ?? selectedModel);
+        } else {
+          // Just append the model attribution line
+          chatHistory.push({ role: "system", content: `↳ ${fw.model_used}` });
+          render();
+        }
+      } else {
+        const content = resp.choices?.[0]?.message?.content ?? "(no response)";
+        isLoading = false;
+        startTypewriter(content, selectedModel);
+      }
       break;
     }
 
@@ -1528,6 +1698,12 @@ window.addEventListener("message", (event) => {
         }
         render();
       }
+      break;
+    }
+
+    case "mcpServers": {
+      mcpServers = (msg.data as McpServer[]) ?? [];
+      render();
       break;
     }
 

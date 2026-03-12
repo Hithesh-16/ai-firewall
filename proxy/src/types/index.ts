@@ -93,6 +93,19 @@ export type ModelPolicyRule = {
   blocked_paths: string[];
 };
 
+export type McpServerConfig = {
+  name: string;
+  targetUrl: string;
+};
+
+export type McpProxyConfig = {
+  enabled: boolean;
+  /** Legacy single-server target (base URL, e.g. http://localhost:3001) */
+  targetUrl?: string;
+  /** Named multi-server targets — preferred over legacy targetUrl */
+  servers?: McpServerConfig[];
+};
+
 export type PolicyConfig = {
   version: string;
   rules: PolicyRules;
@@ -104,6 +117,7 @@ export type PolicyConfig = {
   model_policies?: Record<string, ModelPolicyRule>;
   prompt_injection?: PromptInjectionConfig;
   audit?: AuditConfig;
+  mcp_proxy?: McpProxyConfig;
 };
 
 export type PolicyDecision = {

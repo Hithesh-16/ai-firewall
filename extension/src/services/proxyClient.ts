@@ -380,3 +380,207 @@ export async function addModelWithMeta(
   });
   return res.data as ModelInfo;
 }
+
+// ── MCP Tool Discovery + Execution ────────────────────────────────────────
+
+export type McpTool = {
+  server: string;
+  name: string;
+  description: string;
+  inputSchema: {
+    type: string;
+    properties?: Record<string, unknown>;
+    required?: string[];
+  };
+};
+
+export type McpServer = {
+  name: string;
+  targetUrl: string;
+  online?: boolean;
+};
+
+/** Fetch all tools from all configured MCP servers (aggregated). */
+export async function listMcpTools(): Promise<McpTool[]> {
+  try {
+    const res = await request("GET", "/mcp/proxy/tools");
+    return (res.data ?? []) as McpTool[];
+  } catch {
+    return [];
+  }
+}
+
+/** Execute a single tool call through the MCP security proxy. */
+export async function callMcpTool(
+  serverName: string,
+  toolName: string,
+  args: Record<string, unknown>
+): Promise<{ content: Array<{ type: string; text?: string }>; isError: boolean }> {
+  const res = await request("POST", "/mcp/proxy/call-tool", {
+    serverName, toolName, arguments: args
+  });
+  return res.data as { content: Array<{ type: string; text?: string }>; isError: boolean };
+}
+
+/** List configured MCP servers with live online status. */
+export async function listMcpServers(): Promise<McpServer[]> {
+  try {
+    const res = await request("GET", "/api/mcp/servers");
+    return (res.data ?? []) as McpServer[];
+  } catch {
+    return [];
+  }
+}
+
+/** Add a new MCP server configuration. */
+export async function addMcpServer(name: string, targetUrl: string): Promise<McpServer> {
+  const res = await request("POST", "/api/mcp/servers", { name, targetUrl });
+  if (res.status >= 400) {
+    const errData = res.data as Record<string, unknown>;
+    throw new Error((errData.error as string) ?? "Failed to add MCP server");
+  }
+  return res.data as McpServer;
+}
+
+/** Remove an MCP server configuration by name. */
+export async function deleteMcpServer(name: string): Promise<void> {
+  await request("DELETE", `/api/mcp/servers/${encodeURIComponent(name)}`);
+}
+
+// ── Streaming ──────────────────────────────────────────────────────────────
+
+export type ToolCallResult = {
+  id: string;
+  name: string;   // "server__toolName" format
+  argsJson: string;
+};
+
+export type StreamCallbacks = {
+  onChunk: (text: string) => void;
+  onToolCalls?: (calls: ToolCallResult[]) => void;
+  onDone: (firewallMeta?: FirewallMeta) => void;
+  onError: (err: Error) => void;
+};
+
+/**
+ * Sends a streaming chat completion request to the proxy.
+ * Returns a cancel function — call it to abort mid-stream.
+ *
+ * The proxy already supports SSE for all providers.  We set
+ * `Accept: text/event-stream` and `stream: true` so each
+ * delta arrives as `data: {"choices":[{"delta":{"content":"..."}}]}`.
+ */
+export type OpenAiTool = {
+  type: "function";
+  function: { name: string; description?: string; parameters?: unknown };
+};
+
+export function streamChatCompletion(
+  model: string,
+  messages: ChatMessage[],
+  callbacks: StreamCallbacks,
+  filePaths?: string[],
+  projectRoot?: string,
+  bypassedFilePaths?: string[],
+  tools?: OpenAiTool[]
+): () => void {
+  const base = getBaseUrl();
+  const url = new URL("/v1/chat/completions", base);
+  const isHttps = url.protocol === "https:";
+  const transport = isHttps ? https : http;
+
+  const body = JSON.stringify({
+    model,
+    messages,
+    stream: true,
+    metadata:
+      filePaths || projectRoot || bypassedFilePaths?.length
+        ? {
+            ...(filePaths ? { filePaths } : {}),
+            ...(projectRoot ? { projectRoot } : {}),
+            ...(bypassedFilePaths?.length ? { bypassedFilePaths } : {})
+          }
+        : undefined
+  });
+
+  const auth = getAuthHeader();
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    "Content-Length": String(Buffer.byteLength(body)),
+    Accept: "text/event-stream",
+    ...(auth ? { Authorization: auth } : {})
+  };
+
+  let firewallMeta: FirewallMeta | undefined;
+  let settled = false;
+  // Accumulate streaming tool calls by index (OpenAI streaming format)
+  const toolCallMap: Map<number, { id: string; name: string; argsJson: string }> = new Map();
+
+  const req = transport.request(url, { method: "POST", headers }, (res) => {
+    let buf = "";
+
+    res.on("data", (chunk: Buffer) => {
+      buf += chunk.toString();
+      const lines = buf.split("\n");
+      buf = lines.pop() ?? "";
+
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed.startsWith("data:")) continue;
+        const data = trimmed.slice(5).trim();
+        if (data === "[DONE]") continue;
+        try {
+          const parsed = JSON.parse(data) as Record<string, unknown>;
+          if (parsed._firewall) {
+            firewallMeta = parsed._firewall as FirewallMeta;
+          }
+          const delta = (parsed.choices as any)?.[0]?.delta;
+          // Text content
+          if (delta?.content) callbacks.onChunk(delta.content as string);
+          // Tool call deltas (OpenAI streaming: index-based fragments)
+          const tcDeltas = delta?.tool_calls as Array<{
+            index: number;
+            id?: string;
+            type?: string;
+            function?: { name?: string; arguments?: string };
+          }> | undefined;
+          if (tcDeltas) {
+            for (const tc of tcDeltas) {
+              const idx = tc.index ?? 0;
+              if (!toolCallMap.has(idx)) {
+                toolCallMap.set(idx, { id: "", name: "", argsJson: "" });
+              }
+              const entry = toolCallMap.get(idx)!;
+              if (tc.id) entry.id = tc.id;
+              if (tc.function?.name) entry.name = tc.function.name;
+              if (tc.function?.arguments) entry.argsJson += tc.function.arguments;
+            }
+          }
+        } catch { /* malformed SSE line */ }
+      }
+    });
+
+    res.on("end", () => {
+      if (!settled) {
+        settled = true;
+        if (toolCallMap.size > 0 && callbacks.onToolCalls) {
+          const calls = Array.from(toolCallMap.values()).filter((c) => c.id || c.name);
+          if (calls.length > 0) callbacks.onToolCalls(calls);
+        }
+        callbacks.onDone(firewallMeta);
+      }
+    });
+    res.on("error", (err) => {
+      if (!settled) { settled = true; callbacks.onError(err); }
+    });
+  });
+
+  req.on("error", (err) => {
+    if (!settled) { settled = true; callbacks.onError(err); }
+  });
+  req.setTimeout(300_000, () => req.destroy(new Error("Stream timeout")));
+  req.write(body);
+  req.end();
+
+  return () => { if (!settled) { settled = true; req.destroy(); } };
+}

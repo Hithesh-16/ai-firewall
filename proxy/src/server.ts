@@ -22,6 +22,7 @@ import { registerStatsRoute } from "./routes/stats.route";
 import { registerUsageRoutes } from "./routes/usage.route";
 import { registerAuditRoutes } from "./routes/audit.route";
 import { registerPluginScanRoutes } from "./routes/pluginScan.route";
+import { registerMcpProxyRoutes } from "./routes/mcpProxy.route";
 
 async function bootstrap(): Promise<void> {
   const app = Fastify({
@@ -81,6 +82,9 @@ async function bootstrap(): Promise<void> {
 
   // Core proxy route (auth via API key header or .env)
   await registerAiRoute(app);
+
+  // MCP Security Proxy Gateway
+  await registerMcpProxyRoutes(app);
 
   try {
     await app.listen({ port: env.PORT, host: "0.0.0.0" });
