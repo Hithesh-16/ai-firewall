@@ -25,7 +25,9 @@ function buildProviderUrl(provider: Provider, model: Model): string {
     return `${base}/v1beta/models/${model.modelName}:generateContent`;
   }
 
-  return `${base}/v1/chat/completions`;
+  // OpenAI-compatible (OpenAI, Groq, x.ai, etc.): base often already ends with /v1 (e.g. api.groq.com/openai/v1)
+  const path = base.endsWith("/v1") ? "/chat/completions" : "/v1/chat/completions";
+  return `${base}${path}`;
 }
 
 function isLocalProvider(provider: Provider): boolean {

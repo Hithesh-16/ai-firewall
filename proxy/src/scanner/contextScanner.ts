@@ -19,7 +19,7 @@ const TEST_PATH_PATTERNS = [
   /demo\//i
 ];
 
-const SENSITIVE_PATH_PATTERNS = [
+export const SENSITIVE_PATH_PATTERNS = [
   /src\/(?:auth|payment|billing|security)\//i,
   /config\//i,
   /\.env/i,
@@ -28,6 +28,14 @@ const SENSITIVE_PATH_PATTERNS = [
   /production/i,
   /deploy/i
 ];
+
+/** Returns which of the given file paths match sensitive path patterns (auth/payment/config etc.). */
+export function getSensitivePaths(filePaths: string[]): string[] {
+  if (!filePaths?.length) return [];
+  return filePaths.filter((fp) =>
+    SENSITIVE_PATH_PATTERNS.some((pat) => pat.test(fp))
+  );
+}
 
 const PLACEHOLDER_VALUES = [
   "test123", "password", "secret", "changeme", "example",

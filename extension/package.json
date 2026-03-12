@@ -176,6 +176,11 @@
           "default": "http://localhost:8080",
           "description": "URL of the AI Firewall proxy server"
         },
+        "aiFirewall.apiToken": {
+          "type": "string",
+          "default": "",
+          "description": "Optional API token for proxy (Bearer). Leave empty when using localhost; set if proxy requires auth."
+        },
         "aiFirewall.defaultModel": {
           "type": "string",
           "default": "gpt-4",
@@ -227,5 +232,8 @@
     "@types/vscode": "^1.85.0",
     "esbuild": "^0.24.0",
     "typescript": "^5.9.2"
+  },
+  "dependencies": {
+    "marked": "^17.0.4"
   }
 }

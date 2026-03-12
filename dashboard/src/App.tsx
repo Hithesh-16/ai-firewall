@@ -5,9 +5,11 @@ import RiskScore from "./pages/RiskScore";
 import Settings from "./pages/Settings";
 import SecretTypes from "./pages/SecretTypes";
 import Timeline from "./pages/Timeline";
+import Providers from "./pages/Providers";
 
 const NAV = [
   { to: "/", label: "Overview" },
+  { to: "/providers", label: "Providers & Models" },
   { to: "/logs", label: "Request Log" },
   { to: "/risk", label: "Risk Score" },
   { to: "/secrets", label: "Secret Types" },
@@ -57,6 +59,7 @@ export default function App() {
       <main className="flex-1 overflow-y-auto bg-slate-950 p-6">
         <Routes>
           <Route path="/" element={<Overview />} />
+          <Route path="/providers" element={<Providers />} />
           <Route path="/logs" element={<Logs />} />
           <Route path="/risk" element={<RiskScore />} />
           <Route path="/secrets" element={<SecretTypes />} />

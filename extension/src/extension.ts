@@ -4,11 +4,15 @@ import { registerCodeLensProvider } from "./codeLens";
 import { registerCommands } from "./commands";
 import { registerInlineChat } from "./inlineChat";
 import { registerInlineCompletionProvider } from "./inlineCompletion";
+import { FileIndexer } from "./services/fileIndexer";
 import { createStatusBar, disposeStatusBar } from "./statusBar";
 import { ChatViewProvider } from "./views/chatViewProvider";
 
 export function activate(context: vscode.ExtensionContext): void {
-  const chatProvider = new ChatViewProvider(context.extensionUri);
+  const fileIndexer = new FileIndexer();
+  context.subscriptions.push(fileIndexer);
+
+  const chatProvider = new ChatViewProvider(context.extensionUri, fileIndexer);
 
   context.subscriptions.push(
     vscode.window.registerWebviewViewProvider(

@@ -12,7 +12,9 @@ const envSchema = z.object({
   OPENAI_API_KEY: z.string().optional(),
   DB_PATH: z.string().default("./data/firewall.db"),
   MASTER_KEY: z.string().min(1).optional(),
-  STRICT_LOCAL: z.coerce.boolean().default(false)
+  STRICT_LOCAL: z.coerce.boolean().default(false),
+  /** When true, /api/providers and /api/models accept requests from localhost without a Bearer token (for extension/dashboard local dev). */
+  ALLOW_LOCALHOST_PROVIDER_CONFIG: z.coerce.boolean().default(true)
 });
 
 const parsedEnv = envSchema.safeParse(process.env);

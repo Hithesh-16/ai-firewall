@@ -1,6 +1,6 @@
 import { FastifyInstance } from "fastify";
 import { z } from "zod";
-import { requireAuth, requireRole } from "../auth/authMiddleware";
+import { requireAuthOrLocalhost, requireRoleOnly } from "../auth/authMiddleware";
 import {
   createProvider,
   deleteProvider,
@@ -8,6 +8,7 @@ import {
   getProviderById,
   updateProvider
 } from "../gateway/providerService";
+import { resolveGatewayRoute } from "../gateway/gatewayRouter";
 import { addModel, deleteModel, listModels, updateModel } from "../gateway/modelService";
 
 const createProviderSchema = z.object({
@@ -44,7 +45,7 @@ export async function registerProviderRoutes(app: FastifyInstance): Promise<void
 
   app.post(
     "/api/providers",
-    { preHandler: [requireAuth, requireRole("admin", "security_lead")] },
+    { preHandler: [requireAuthOrLocalhost, requireRoleOnly("admin", "security_lead", "developer")] },
     async (request, reply) => {
       const parsed = createProviderSchema.safeParse(request.body);
       if (!parsed.success) {
@@ -73,7 +74,7 @@ export async function registerProviderRoutes(app: FastifyInstance): Promise<void
 
   app.get(
     "/api/providers",
-    { preHandler: [requireAuth] },
+    { preHandler: [requireAuthOrLocalhost] },
     async () => {
       const providers = listProviders();
       return providers.map((p) => ({
@@ -89,7 +90,7 @@ export async function registerProviderRoutes(app: FastifyInstance): Promise<void
 
   app.get(
     "/api/providers/:id",
-    { preHandler: [requireAuth] },
+    { preHandler: [requireAuthOrLocalhost] },
     async (request, reply) => {
       const { id } = request.params as { id: string };
       const provider = getProviderById(Number(id));
@@ -110,7 +111,7 @@ export async function registerProviderRoutes(app: FastifyInstance): Promise<void
 
   app.patch(
     "/api/providers/:id",
-    { preHandler: [requireAuth, requireRole("admin", "security_lead")] },
+    { preHandler: [requireAuthOrLocalhost, requireRoleOnly("admin", "security_lead", "developer")] },
     async (request, reply) => {
       const { id } = request.params as { id: string };
       const parsed = updateProviderSchema.safeParse(request.body);
@@ -134,7 +135,7 @@ export async function registerProviderRoutes(app: FastifyInstance): Promise<void
 
   app.delete(
     "/api/providers/:id",
-    { preHandler: [requireAuth, requireRole("admin")] },
+    { preHandler: [requireAuthOrLocalhost, requireRoleOnly("admin")] },
     async (request, reply) => {
       const { id } = request.params as { id: string };
       const deleted = deleteProvider(Number(id));
@@ -149,7 +150,7 @@ export async function registerProviderRoutes(app: FastifyInstance): Promise<void
 
   app.post(
     "/api/providers/:providerId/models",
-    { preHandler: [requireAuth, requireRole("admin", "security_lead")] },
+    { preHandler: [requireAuthOrLocalhost, requireRoleOnly("admin", "security_lead", "developer")] },
     async (request, reply) => {
       const { providerId } = request.params as { providerId: string };
       const provider = getProviderById(Number(providerId));
@@ -182,7 +183,7 @@ export async function registerProviderRoutes(app: FastifyInstance): Promise<void
 
   app.get(
     "/api/providers/:providerId/models",
-    { preHandler: [requireAuth] },
+    { preHandler: [requireAuthOrLocalhost] },
     async (request, reply) => {
       const { providerId } = request.params as { providerId: string };
       const provider = getProviderById(Number(providerId));
@@ -195,15 +196,19 @@ export async function registerProviderRoutes(app: FastifyInstance): Promise<void
 
   app.get(
     "/api/models",
-    { preHandler: [requireAuth] },
+    { preHandler: [requireAuthOrLocalhost] },
     async () => {
-      return listModels();
+      const models = listModels();
+      return models.map((m) => ({
+        ...m,
+        registered: resolveGatewayRoute(m.modelName) !== null
+      }));
     }
   );
 
   app.patch(
     "/api/models/:id",
-    { preHandler: [requireAuth, requireRole("admin", "security_lead")] },
+    { preHandler: [requireAuthOrLocalhost, requireRoleOnly("admin", "security_lead", "developer")] },
     async (request, reply) => {
       const { id } = request.params as { id: string };
       const parsed = updateModelSchema.safeParse(request.body);
@@ -220,7 +225,7 @@ export async function registerProviderRoutes(app: FastifyInstance): Promise<void
 
   app.delete(
     "/api/models/:id",
-    { preHandler: [requireAuth, requireRole("admin")] },
+    { preHandler: [requireAuthOrLocalhost, requireRoleOnly("admin")] },
     async (request, reply) => {
       const { id } = request.params as { id: string };
       const deleted = deleteModel(Number(id));

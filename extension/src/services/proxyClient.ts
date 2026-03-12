@@ -8,6 +8,13 @@ function getBaseUrl(): string {
     .get<string>("proxyUrl", "http://localhost:8080");
 }
 
+function getAuthHeader(): string | undefined {
+  const token = vscode.workspace
+    .getConfiguration("aiFirewall")
+    .get<string>("apiToken", "");
+  return token?.trim() ? `Bearer ${token.trim()}` : undefined;
+}
+
 function request(
   method: string,
   path: string,
@@ -20,15 +27,18 @@ function request(
     const transport = isHttps ? https : http;
 
     const payload = body ? JSON.stringify(body) : undefined;
+    const auth = getAuthHeader();
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json",
+      ...(payload ? { "Content-Length": String(Buffer.byteLength(payload)) } : {}),
+      ...(auth ? { Authorization: auth } : {})
+    };
 
     const req = transport.request(
       url,
       {
         method,
-        headers: {
-          "Content-Type": "application/json",
-          ...(payload ? { "Content-Length": Buffer.byteLength(payload) } : {})
-        }
+        headers
       },
       (res) => {
         let raw = "";
@@ -69,6 +79,8 @@ export type EstimateResult = {
     filesBlocked: string[];
     riskScore: number;
     reasons: string[];
+    sensitiveFiles?: string[];
+    findingTypes?: string[];
   };
   model: {
     name: string;
@@ -130,6 +142,8 @@ export type ChatResponse = {
   error?: string;
 };
 
+export type AuthUser = { id: number; email: string; name: string; role: string; orgId?: number | null };
+
 export async function checkHealth(): Promise<boolean> {
   try {
     const res = await request("GET", "/health");
@@ -142,12 +156,20 @@ export async function checkHealth(): Promise<boolean> {
 export async function estimate(
   model: string,
   messages: ChatMessage[],
-  filePaths?: string[]
+  filePaths?: string[],
+  projectRoot?: string,
+  bypassedFilePaths?: string[]
 ): Promise<EstimateResult> {
   const res = await request("POST", "/api/estimate", {
     model,
     messages,
-    metadata: filePaths ? { filePaths } : undefined
+    metadata: filePaths || projectRoot || bypassedFilePaths?.length
+      ? {
+          ...(filePaths ? { filePaths } : {}),
+          ...(projectRoot ? { projectRoot } : {}),
+          ...(bypassedFilePaths?.length ? { bypassedFilePaths } : {})
+        }
+      : undefined
   });
   return res.data as EstimateResult;
 }
@@ -155,20 +177,91 @@ export async function estimate(
 export async function chatCompletion(
   model: string,
   messages: ChatMessage[],
-  filePaths?: string[]
+  filePaths?: string[],
+  projectRoot?: string,
+  bypassedFilePaths?: string[]
 ): Promise<ChatResponse> {
   const res = await request("POST", "/v1/chat/completions", {
     model,
     messages,
-    metadata: filePaths ? { filePaths } : undefined
+    metadata: filePaths || projectRoot || bypassedFilePaths?.length
+      ? {
+          ...(filePaths ? { filePaths } : {}),
+          ...(projectRoot ? { projectRoot } : {}),
+          ...(bypassedFilePaths?.length ? { bypassedFilePaths } : {})
+        }
+      : undefined
   });
   if (res.status >= 400) {
     const errData = res.data as Record<string, unknown>;
-    throw new Error(
-      (errData.error as string) ?? `Request failed with status ${res.status}`
-    );
+    const main = (errData.error as string) ?? `Request failed with status ${res.status}`;
+    const details = errData.details;
+    const detailsStr =
+      details === undefined || details === null
+        ? ""
+        : typeof details === "string"
+          ? details
+          : typeof (details as { error?: { message?: string } }).error?.message === "string"
+            ? (details as { error: { message: string } }).error.message
+            : JSON.stringify(details);
+    const full = detailsStr ? `${main}: ${detailsStr}` : main;
+    throw new Error(full);
   }
   return res.data as ChatResponse;
+}
+
+export async function login(email: string, password: string): Promise<{ user: AuthUser; token: string }> {
+  const res = await request("POST", "/api/auth/login", { email, password });
+  if (res.status >= 400) {
+    const errData = res.data as Record<string, unknown>;
+    throw new Error((errData.error as string) ?? `Login failed with status ${res.status}`);
+  }
+  return res.data as { user: AuthUser; token: string };
+}
+
+export async function register(email: string, name: string, password: string): Promise<{ user: AuthUser; token: string }> {
+  const res = await request("POST", "/api/auth/register", { email, name, password });
+  if (res.status >= 400) {
+    const errData = res.data as Record<string, unknown>;
+    throw new Error((errData.error as string) ?? `Register failed with status ${res.status}`);
+  }
+  return res.data as { user: AuthUser; token: string };
+}
+
+export async function me(): Promise<{ user: AuthUser }> {
+  const res = await request("GET", "/api/auth/me");
+  if (res.status >= 400) {
+    const errData = res.data as Record<string, unknown>;
+    throw new Error((errData.error as string) ?? `Auth check failed with status ${res.status}`);
+  }
+  return res.data as { user: AuthUser };
+}
+
+export type FileScopeConfig = {
+  mode: "blocklist" | "allowlist";
+  blocklist: string[];
+  allowlist: string[];
+  max_file_size_kb: number;
+  scan_on_open: boolean;
+  scan_on_send: boolean;
+};
+
+export async function getFileScope(): Promise<{ file_scope: FileScopeConfig }> {
+  const res = await request("GET", "/api/file-scope");
+  if (res.status >= 400) {
+    const errData = res.data as Record<string, unknown>;
+    throw new Error((errData.error as string) ?? `GET /api/file-scope failed: ${res.status}`);
+  }
+  return res.data as { file_scope: FileScopeConfig };
+}
+
+export async function updateFileScope(file_scope: FileScopeConfig): Promise<{ ok: true; file_scope: FileScopeConfig }> {
+  const res = await request("PUT", "/api/file-scope", file_scope);
+  if (res.status >= 400) {
+    const errData = res.data as Record<string, unknown>;
+    throw new Error((errData.error as string) ?? `PUT /api/file-scope failed: ${res.status}`);
+  }
+  return res.data as { ok: true; file_scope: FileScopeConfig };
 }
 
 export async function listProviders(): Promise<ProviderInfo[]> {

@@ -33,8 +33,11 @@ export function registerInlineCompletionProvider(
         return undefined;
       }
 
-      const model = config.get<string>("completionModel", "") ||
-                     config.get<string>("defaultModel", "gpt-4");
+      // Completions use a dedicated fast model to keep latency low.
+      // Falls back to defaultModel only if completionModel is not set.
+      const model = config.get<string>("completionModel", "").trim() ||
+                     config.get<string>("defaultModel", "").trim() ||
+                     "gpt-4o-mini";
 
       const prefix = document.getText(
         new vscode.Range(
@@ -77,7 +80,7 @@ export function registerInlineCompletionProvider(
           return undefined;
         }
 
-        const cleaned = cleanCompletion(text);
+        const cleaned = cleanCompletion(text, suffix);
         if (!cleaned) {
           return undefined;
         }
@@ -135,7 +138,7 @@ function buildCompletionPrompt(
   return parts.join("\n\n");
 }
 
-function cleanCompletion(raw: string): string | undefined {
+function cleanCompletion(raw: string, suffix: string): string | undefined {
   let text = raw;
 
   const fenceMatch = text.match(/^```[\w]*\n([\s\S]*?)```\s*$/);
@@ -155,5 +158,32 @@ function cleanCompletion(raw: string): string | undefined {
     text = lines.slice(0, 30).join("\n");
   }
 
-  return text;
+  // Strip trailing brackets/braces/parens that duplicate what already exists at the start of `suffix`
+  text = stripDuplicateSuffix(text, suffix);
+
+  return text || undefined;
+}
+
+/**
+ * If the LLM's completion ends with closing brackets that already exist at the
+ * beginning of the code after the cursor, strip them to avoid duplicate syntax.
+ * e.g. completion ends with "  }\n}" but suffix starts with "\n}" — remove the last "}"
+ */
+function stripDuplicateSuffix(completion: string, suffix: string): string {
+  const CLOSERS = /^[\s\}\)\];,]+/;
+  const suffixTrimmed = suffix.trimStart();
+  const suffixOpeners = (suffixTrimmed.match(CLOSERS) ?? [""])[0].replace(/\s/g, "");
+  if (!suffixOpeners) return completion;
+
+  let result = completion;
+  // Walk backwards: if completion ends with a char that suffix starts with, strip it
+  for (const ch of suffixOpeners.split("").reverse()) {
+    const trimmed = result.trimEnd();
+    if (trimmed.endsWith(ch)) {
+      // Remove the last occurrence of ch and any trailing whitespace before it
+      const idx = result.lastIndexOf(ch);
+      result = result.slice(0, idx) + result.slice(idx + 1);
+    }
+  }
+  return result;
 }

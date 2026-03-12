@@ -26,10 +26,10 @@ import {
 import { scanPII } from "../scanner/piiScanner";
 import { scanSecrets } from "../scanner/secretScanner";
 import { scanEntropy } from "../scanner/entropyScanner";
-import { adjustSeverity } from "../scanner/contextScanner";
+import { adjustSeverity, getSensitivePaths } from "../scanner/contextScanner";
 import { scanPromptInjection } from "../scanner/promptInjectionScanner";
 import { evaluateModelPolicy } from "../policy/modelPolicy";
-import { validateFilePaths } from "../scope/fileScope";
+import { validateFilePathsWithRoot } from "../scope/fileScope";
 import { ChatCompletionRequest } from "../types";
 
 const chatSchema = z.object({
@@ -64,6 +64,20 @@ function isGeminiProvider(slug: string): boolean {
   return slug.includes("google") || slug.includes("gemini");
 }
 
+function upstreamErrorDetails(error: unknown): string {
+  if (axios.isAxiosError(error)) {
+    const data = error.response?.data;
+    if (data === undefined || data === null) return error.message ?? "Unknown error";
+    if (typeof data === "string") return data;
+    const obj = data as Record<string, unknown>;
+    const msg = obj.error && typeof (obj.error as Record<string, unknown>).message === "string"
+      ? (obj.error as { message: string }).message
+      : obj.message ?? obj.error;
+    return typeof msg === "string" ? msg : JSON.stringify(data);
+  }
+  return error instanceof Error ? error.message : "Unknown provider error";
+}
+
 export async function registerAiRoute(app: FastifyInstance): Promise<void> {
   app.post("/v1/chat/completions", async (request, reply) => {
     const startedAt = Date.now();
@@ -76,7 +90,7 @@ export async function registerAiRoute(app: FastifyInstance): Promise<void> {
     }
 
     const payload = parsed.data as ChatCompletionRequest & {
-      metadata?: { projectRoot?: string };
+      metadata?: { projectRoot?: string; bypassedFilePaths?: string[] };
     };
 
     // --- Policy evaluation (unchanged from Phase 1-3) ---
@@ -84,10 +98,31 @@ export async function registerAiRoute(app: FastifyInstance): Promise<void> {
     const policy = mergeProjectPolicy(globalPolicy, payload.metadata?.projectRoot);
 
     const rawText = mergeMessages(payload.messages);
-    const fileScopeResults = validateFilePaths(
-      payload.metadata?.filePaths,
-      policy.file_scope
+    const filePathsOriginal = payload.metadata?.filePaths ?? [];
+    const bypassedFilePaths = payload.metadata?.bypassedFilePaths ?? [];
+    const fileScopeResults = validateFilePathsWithRoot(
+      filePathsOriginal,
+      policy.file_scope,
+      payload.metadata?.projectRoot
     );
+
+    // Track excluded files for transparency in response
+    const excludedFiles = filePathsOriginal.filter((_, i) => !fileScopeResults[i]?.allowed);
+
+    // Auto-filter: keep only paths allowed by file scope, then by model policy
+    let allowedByScope = filePathsOriginal.filter((p, i) => fileScopeResults[i]?.allowed);
+    const modelPolicies = policy.model_policies;
+    if (modelPolicies && allowedByScope.length > 0) {
+      const mpResult = evaluateModelPolicy(payload.model, allowedByScope, modelPolicies);
+      if (!mpResult.allowed && mpResult.blockedFiles.length > 0) {
+        allowedByScope = allowedByScope.filter((p) => !mpResult.blockedFiles.includes(p));
+      }
+    }
+    // Bypassed files (user explicitly allowed) are appended without scope filtering
+    const effectiveFilePaths = [...allowedByScope, ...bypassedFilePaths];
+    if (payload.metadata) {
+      payload.metadata = { ...payload.metadata, filePaths: effectiveFilePaths };
+    }
 
     const secretResult = scanSecrets(rawText);
     const piiResult = scanPII(rawText);
@@ -101,7 +136,7 @@ export async function registerAiRoute(app: FastifyInstance): Promise<void> {
 
     // Context-aware severity adjustments (based on file paths / placeholders)
     const contextReasons: string[] = [];
-    const filePaths = payload.metadata?.filePaths;
+    const filePaths = effectiveFilePaths.length > 0 ? effectiveFilePaths : payload.metadata?.filePaths;
 
     for (const s of secretResult.secrets) {
       try {
@@ -127,9 +162,25 @@ export async function registerAiRoute(app: FastifyInstance): Promise<void> {
       }
     }
 
-    const decision = evaluatePolicy(secretResult, piiResult, policy, fileScopeResults);
+    // Pass empty array: file scope filtering is already done above, so policyEngine
+    // only evaluates content (secrets/PII) — not files — to avoid false 403 blocks.
+    const decision = evaluatePolicy(secretResult, piiResult, policy, []);
+    const filePathsForContext = effectiveFilePaths.length > 0 ? effectiveFilePaths : payload.metadata?.filePaths ?? [];
+    const sensitiveFilePaths = getSensitivePaths(filePathsForContext);
+    const findingTypeRegex = /\(([A-Z_]+)\)\s*$/;
+    const uniqueFindingTypes = contextReasons.length
+      ? ([...new Set(contextReasons.map((r) => findingTypeRegex.exec(r)?.[1]).filter(Boolean))] as string[])
+      : [];
     if (contextReasons.length > 0) {
-      decision.reasons = [...new Set([...(decision.reasons ?? []), ...contextReasons])];
+      const policyReasons = decision.reasons ?? [];
+      const summaryParts: string[] = [];
+      if (sensitiveFilePaths.length > 0) {
+        summaryParts.push(`Files with sensitive content: ${sensitiveFilePaths.slice(0, 10).join(", ")}${sensitiveFilePaths.length > 10 ? "…" : ""}`);
+      }
+      if (uniqueFindingTypes.length > 0) {
+        summaryParts.push(`Finding types: ${uniqueFindingTypes.join(", ")}`);
+      }
+      decision.reasons = [...policyReasons, summaryParts.length ? summaryParts.join(". ") : contextReasons[0]];
     }
 
     // Prompt-injection detection
@@ -199,19 +250,6 @@ export async function registerAiRoute(app: FastifyInstance): Promise<void> {
         ...message,
         content: redact(message.content, redactionInput)
       }));
-    }
-
-    // Per-model policy enforcement
-    const modelPolicies = policy.model_policies;
-    if (modelPolicies) {
-      const mpResult = evaluateModelPolicy(payload.model, payload.metadata?.filePaths, modelPolicies);
-      if (!mpResult.allowed) {
-        return reply.status(403).send({
-          error: mpResult.reason,
-          code: "MODEL_POLICY_BLOCKED",
-          blockedFiles: mpResult.blockedFiles
-        });
-      }
     }
 
     // === GATEWAY PATH: provider is registered in Phase 4 system ===
@@ -358,7 +396,11 @@ export async function registerAiRoute(app: FastifyInstance): Promise<void> {
             action: shouldRedact ? "REDACT" : "ALLOW",
             secrets_found: secretResult.secrets.length,
             pii_found: piiResult.pii.length,
-            files_blocked: 0,
+            ...(shouldRedact && outboundMessages.length > 0
+              ? { redacted_messages: outboundMessages.map((m) => ({ role: m.role, content: m.content })) }
+              : {}),
+            files_excluded: excludedFiles.length,
+            files_excluded_list: excludedFiles.slice(0, 10),
             risk_score: decision.riskScore,
             routed_to: gatewayRoute.provider.name,
             model_used: gatewayRoute.model.modelName,
@@ -368,9 +410,7 @@ export async function registerAiRoute(app: FastifyInstance): Promise<void> {
           }
         };
       } catch (error) {
-        const message = axios.isAxiosError(error)
-          ? error.response?.data ?? error.message
-          : "Unknown provider error";
+        const message = upstreamErrorDetails(error);
 
         logRequest({
           timestamp: Date.now(),
@@ -383,7 +423,7 @@ export async function registerAiRoute(app: FastifyInstance): Promise<void> {
           filesBlocked: 0,
           riskScore: decision.riskScore,
           action: shouldRedact ? "REDACT" : "ALLOW",
-          reasons: [`Provider error: ${JSON.stringify(message)}`],
+          reasons: [`Provider error: ${message}`],
           responseTimeMs: Date.now() - startedAt
         });
 
@@ -442,7 +482,11 @@ export async function registerAiRoute(app: FastifyInstance): Promise<void> {
             action: shouldRedact ? "REDACT" : "ALLOW",
             secrets_found: secretResult.secrets.length,
             pii_found: piiResult.pii.length,
-            files_blocked: 0,
+            ...(shouldRedact && outboundMessages.length > 0
+              ? { redacted_messages: outboundMessages.map((m) => ({ role: m.role, content: m.content })) }
+              : {}),
+            files_excluded: excludedFiles.length,
+            files_excluded_list: excludedFiles.slice(0, 10),
             risk_score: decision.riskScore,
             routed_to: "local_llm",
             model_used: smartRoute.model
@@ -495,16 +539,18 @@ export async function registerAiRoute(app: FastifyInstance): Promise<void> {
           action: shouldRedact ? "REDACT" : "ALLOW",
           secrets_found: secretResult.secrets.length,
           pii_found: piiResult.pii.length,
-          files_blocked: 0,
+          ...(shouldRedact && outboundMessages.length > 0
+            ? { redacted_messages: outboundMessages.map((m) => ({ role: m.role, content: m.content })) }
+            : {}),
+          files_excluded: excludedFiles.length,
+          files_excluded_list: excludedFiles.slice(0, 10),
           risk_score: decision.riskScore,
           routed_to: smartRoute.target,
           model_used: smartRoute.model
         }
       };
     } catch (error) {
-      const message = axios.isAxiosError(error)
-        ? error.response?.data ?? error.message
-        : "Unknown provider error";
+      const message = upstreamErrorDetails(error);
 
       logRequest({
         timestamp: Date.now(),
@@ -517,7 +563,7 @@ export async function registerAiRoute(app: FastifyInstance): Promise<void> {
         filesBlocked: 0,
         riskScore: decision.riskScore,
         action: shouldRedact ? "REDACT" : "ALLOW",
-        reasons: [`Provider error: ${JSON.stringify(message)}`],
+        reasons: [`Provider error: ${message}`],
         responseTimeMs: Date.now() - startedAt
       });
 

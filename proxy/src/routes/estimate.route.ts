@@ -9,12 +9,12 @@ import { mergeProjectPolicy } from "../policy/projectPolicy";
 import { scanPII } from "../scanner/piiScanner";
 import { scanSecrets } from "../scanner/secretScanner";
 import { scanEntropy } from "../scanner/entropyScanner";
-import { adjustSeverity } from "../scanner/contextScanner";
+import { adjustSeverity, getSensitivePaths } from "../scanner/contextScanner";
 import { scanPromptInjection } from "../scanner/promptInjectionScanner";
 import { evaluateModelPolicy } from "../policy/modelPolicy";
 import { analyzeBlindMi } from "../audit/blindMi";
 import { githubSearch } from "../tools/githubSearch";
-import { validateFilePaths } from "../scope/fileScope";
+import { validateFilePathsWithRoot } from "../scope/fileScope";
 
 const estimateSchema = z.object({
   model: z.string(),
@@ -27,7 +27,8 @@ const estimateSchema = z.object({
   metadata: z
     .object({
       filePaths: z.array(z.string()).optional(),
-      projectRoot: z.string().optional()
+      projectRoot: z.string().optional(),
+      bypassedFilePaths: z.array(z.string()).optional()
     })
     .optional()
 });
@@ -51,7 +52,30 @@ export async function registerEstimateRoute(app: FastifyInstance): Promise<void>
     const policy = mergeProjectPolicy(globalPolicy, metadata?.projectRoot);
 
     const rawText = messages.map((m) => m.content).join("\n");
-    const fileScopeResults = validateFilePaths(metadata?.filePaths, policy.file_scope);
+    const filePathsOriginal = metadata?.filePaths ?? [];
+    const bypassedFilePaths = metadata?.bypassedFilePaths ?? [];
+    const fileScopeResults = validateFilePathsWithRoot(
+      filePathsOriginal,
+      policy.file_scope,
+      metadata?.projectRoot
+    );
+
+    // Track excluded files for transparency
+    const excludedFiles = filePathsOriginal.filter((_, i) => !fileScopeResults[i]?.allowed);
+
+    // Auto-filter: keep only paths allowed by file scope, then by model policy
+    let allowedByScope = filePathsOriginal.filter((p, i) => fileScopeResults[i]?.allowed);
+    const modelPolicies = policy.model_policies;
+    let modelPolicyBlocked: { reason?: string; blockedFiles: string[] } | undefined;
+    if (modelPolicies && allowedByScope.length > 0) {
+      const mpResult = evaluateModelPolicy(model, allowedByScope, modelPolicies);
+      if (!mpResult.allowed && mpResult.blockedFiles.length > 0) {
+        modelPolicyBlocked = { reason: mpResult.reason, blockedFiles: mpResult.blockedFiles };
+        allowedByScope = allowedByScope.filter((p) => !mpResult.blockedFiles.includes(p));
+      }
+    }
+    // Bypassed files (user explicitly allowed) are appended without scope filtering
+    const effectiveFilePaths = [...allowedByScope, ...bypassedFilePaths];
 
     const secretResult = scanSecrets(rawText);
     const piiResult = scanPII(rawText);
@@ -65,7 +89,7 @@ export async function registerEstimateRoute(app: FastifyInstance): Promise<void>
 
     // Context adjustments
     const contextReasons: string[] = [];
-    const filePaths = metadata?.filePaths;
+    const filePaths = effectiveFilePaths.length > 0 ? effectiveFilePaths : metadata?.filePaths;
     for (const s of secretResult.secrets) {
       try {
         const adj = adjustSeverity(s.value, s.type, s.severity, filePaths);
@@ -85,21 +109,25 @@ export async function registerEstimateRoute(app: FastifyInstance): Promise<void>
       } catch (e) {}
     }
 
-    const decision = evaluatePolicy(secretResult, piiResult, policy, fileScopeResults);
+    // Pass empty array: file scope filtering is already done above, so policyEngine
+    // only evaluates content (secrets/PII) — not files — to avoid false 403 blocks.
+    const decision = evaluatePolicy(secretResult, piiResult, policy, []);
+    const filePathsForContext = effectiveFilePaths.length > 0 ? effectiveFilePaths : metadata?.filePaths ?? [];
+    const sensitiveFilePaths = getSensitivePaths(filePathsForContext);
+    const findingTypeRegex = /\(([A-Z_]+)\)\s*$/;
+    const uniqueFindingTypes = contextReasons.length
+      ? ([...new Set(contextReasons.map((r) => findingTypeRegex.exec(r)?.[1]).filter(Boolean))] as string[])
+      : [];
     if (contextReasons.length > 0) {
-      decision.reasons = [...new Set([...(decision.reasons ?? []), ...contextReasons])];
-    }
-
-    // Per-model policy enforcement
-    const modelPolicies = policy.model_policies;
-    let modelPolicyBlocked: { reason?: string; blockedFiles: string[] } | undefined;
-    if (modelPolicies) {
-      const mpResult = evaluateModelPolicy(model, metadata?.filePaths, modelPolicies);
-      if (!mpResult.allowed) {
-        decision.action = "BLOCK";
-        decision.reasons.push(mpResult.reason ?? "Model policy blocked");
-        modelPolicyBlocked = { reason: mpResult.reason, blockedFiles: mpResult.blockedFiles };
+      const policyReasons = decision.reasons ?? [];
+      const summaryParts: string[] = [];
+      if (sensitiveFilePaths.length > 0) {
+        summaryParts.push(`Files with sensitive content: ${sensitiveFilePaths.slice(0, 10).join(", ")}${sensitiveFilePaths.length > 10 ? "…" : ""}`);
       }
+      if (uniqueFindingTypes.length > 0) {
+        summaryParts.push(`Finding types: ${uniqueFindingTypes.join(", ")}`);
+      }
+      decision.reasons = [...policyReasons, summaryParts.length ? summaryParts.join(". ") : contextReasons[0]];
     }
 
     // Prompt-injection detection
@@ -165,8 +193,11 @@ export async function registerEstimateRoute(app: FastifyInstance): Promise<void>
         secretsFound: secretResult.secrets.length,
         piiFound: piiResult.pii.length,
         filesBlocked: decision.filesBlocked,
+        filesExcluded: excludedFiles,
         riskScore: decision.riskScore,
-        reasons: decision.reasons
+        reasons: decision.reasons,
+        sensitiveFiles: sensitiveFilePaths,
+        findingTypes: uniqueFindingTypes
       },
       modelPolicyBlocked,
       promptInjection,

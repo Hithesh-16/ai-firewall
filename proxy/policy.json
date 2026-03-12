@@ -26,7 +26,14 @@
       "**/.git/**",
       "**/node_modules/**",
       "**/dist/**",
-      "**/.aifirewall-vault/**"
+      "**/.aifirewall-vault/**",
+      "docs",
+      "pnpm-lock.yaml",
+      "public",
+      "README.md",
+      "tsconfig.json",
+      "Hithesh_K_Resume.html",
+      "src"
     ],
     "allowlist": [],
     "max_file_size_kb": 500,
@@ -43,19 +50,32 @@
   "smart_routing": {
     "enabled": false,
     "routes": [
-      { "condition": "risk_score >= 70", "target": "local_llm" },
-      { "condition": "risk_score >= 30", "target": "cloud_redacted" },
-      { "condition": "default", "target": "cloud_direct" }
+      {
+        "condition": "risk_score >= 70",
+        "target": "local_llm"
+      },
+      {
+        "condition": "risk_score >= 30",
+        "target": "cloud_redacted"
+      },
+      {
+        "condition": "default",
+        "target": "cloud_direct"
+      }
     ],
     "local_llm": {
       "provider": "ollama",
       "model": "llama3",
       "endpoint": "http://localhost:11434"
     }
-  }
-,
+  },
   "model_policies": {
-    "default": { "allowed_paths": ["**"], "blocked_paths": [] }
+    "default": {
+      "allowed_paths": [
+        "**"
+      ],
+      "blocked_paths": []
+    }
   },
   "prompt_injection": {
     "enabled": true,

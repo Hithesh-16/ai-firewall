@@ -57,8 +57,12 @@ export function evaluatePolicy(
   const hasPrivateKey = secretResult.secrets.some((s) => s.type === "PRIVATE_KEY");
 
   if (hasCriticalSecret || hasPrivateKey) {
-    if (hasPrivateKey) reasons.push("Private key detected");
-    if (hasCriticalSecret && !hasPrivateKey) reasons.push("Critical secret detected");
+    const criticalSecretTypes = [...new Set(secretResult.secrets.filter((s) => s.severity === "critical" || s.type === "PRIVATE_KEY").map((s) => s.type))];
+    const criticalPiiTypes = [...new Set(piiResult.pii.filter((p) => p.severity === "critical").map((p) => p.type))];
+    const parts: string[] = [];
+    if (criticalSecretTypes.length) parts.push(`Secrets: ${criticalSecretTypes.join(", ")}`);
+    if (criticalPiiTypes.length) parts.push(`PII: ${criticalPiiTypes.join(", ")}`);
+    reasons.push(parts.length ? `Blocked — ${parts.join(". ")}` : (hasPrivateKey ? "Private key detected" : "Critical secret detected"));
     return {
       action: "BLOCK",
       reasons,
