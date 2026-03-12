@@ -45,6 +45,7 @@ let pendingEstimate: EstResult | null = null;
 let pendingMessages: ChatMsg[] = [];
 let pendingFilePaths: string[] = [];
 let pendingBypassedPaths: string[] = [];
+let pendingImages: { name: string; dataUrl: string }[] = [];
 let isLoading = false;
 let showPreFlight = true;
 let toastMsg = "";
@@ -60,37 +61,61 @@ let mentionAtStart = -1; // cursor position where @ was typed
 
 // Agent mode (plan / create / edit)
 let agentMode = false;
+let autoApplyOps = false; // auto-apply file ops without diff review
 
 // Pending file operations from LLM
 let pendingFileOps: FileOp[] = [];
 
+// Model catalog from proxy
+type CatalogModel = { modelName: string; displayName: string; inputCostPer1k: number; outputCostPer1k: number; maxContextTokens: number; tags?: string[] };
+type CatalogProvider = { name: string; slug: string; baseUrl: string; authUrl: string; description: string; models: CatalogModel[] };
+let catalog: CatalogProvider[] = [];
+
+// Provider setup state (Providers tab)
+let setupProviderSlug = ""; // which catalog provider is being configured
+let setupApiKey = "";
+let selectedCatalogModels: Set<string> = new Set();
+
+// Phase indicator state
+let currentPhase = "";
+let currentPhaseLabel = "";
+
+// Typewriter animation state
+let typewriterTimer: ReturnType<typeof setInterval> | null = null;
+
 // ── Rendering ──────────────────────────────────────────────────────────
 
 function render(): void {
+  // ── Preserve textarea state so re-renders never clear what the user is typing ──
+  const prevInput = document.getElementById("chat-input") as HTMLTextAreaElement | null;
+  const savedText   = prevInput?.value ?? "";
+  const savedHeight = prevInput?.style.height ?? "";
+  const hadFocus    = document.activeElement === prevInput;
+
   const app = document.getElementById("app")!;
   app.innerHTML = `
     ${renderConnectionBar()}
     ${authed ? `
-      <div class="tabs">
+      <div class="tabs" role="tablist" aria-label="AI Firewall panels">
         ${renderTab("chat", "Chat")}
         ${renderTab("providers", "Providers")}
         ${renderTab("models", "Models")}
         ${renderTab("credits", "Credits")}
         ${renderTab("activity", "Activity")}
       </div>
-      <div class="panel ${currentTab === "chat" ? "active" : ""}" id="panel-chat">
+      <div class="panel ${currentTab === "chat" ? "active" : ""}" id="panel-chat" role="tabpanel" aria-label="Chat">
         ${renderChat()}
       </div>
-      <div class="panel ${currentTab === "providers" ? "active" : ""}" id="panel-providers">
+      <div class="panel ${currentTab === "providers" ? "active" : ""}" id="panel-providers" role="tabpanel" aria-label="Providers">
         ${renderProviders()}
       </div>
-      <div class="panel ${currentTab === "models" ? "active" : ""}" id="panel-models">
+      <div class="panel ${currentTab === "models" ? "active" : ""}" id="panel-models" role="tabpanel" aria-label="Models">
         ${renderModels()}
       </div>
-      <div class="panel ${currentTab === "credits" ? "active" : ""}" id="panel-credits">
+      <div class="panel ${currentTab === "credits" ? "active" : ""}" id="panel-credits" role="tabpanel" aria-label="Credits">
         ${renderCredits()}
       </div>
-      <div class="panel ${currentTab === "activity" ? "active" : ""}" id="panel-activity">
+      <div class="panel ${currentTab === "activity" ? "active" : ""}" id="panel-activity" role="tabpanel" aria-label="Activity">
         ${renderActivity()}
       </div>
     ` : `
@@ -98,9 +123,16 @@ function render(): void {
         ${renderLogin()}
       </div>
     `}
-    ${toastMsg ? `<div class="toast">${esc(toastMsg)}</div>` : ""}
+    ${toastMsg ? `<div class="toast" role="alert" aria-live="assertive">${esc(toastMsg)}</div>` : ""}
   `;
   bindEvents();
+
+  // ── Restore textarea content and focus after DOM replacement ──
+  const newInput = document.getElementById("chat-input") as HTMLTextAreaElement | null;
+  if (newInput) {
+    if (savedText)   { newInput.value = savedText; newInput.style.height = savedHeight; }
+    if (hadFocus)    { newInput.focus(); }
+  }
 }
 
 function renderConnectionBar(): string {
@@ -130,21 +162,26 @@ function renderLogin(): string {
 }
 
 function renderTab(id: string, label: string): string {
-  return `<button type="button" class="tab ${currentTab === id ? "active" : ""}" data-tab="${id}">${label}</button>`;
+  const active = currentTab === id;
+  return `<button type="button" class="tab ${active ? "active" : ""}" data-tab="${id}" role="tab" aria-selected="${active}" aria-controls="panel-${id}">${label}</button>`;
 }
 
 // ── Chat ────────────────────────────────────────────────────────────────
 
+// SVG icons as constants
+const ICON_SEND = `<svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 1l7 7-7 7M15 8H1"/></svg>`;
+const ICON_SEND_FILLED = `<svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><circle cx="8" cy="8" r="8"/><path d="M8 4.5l3.5 3.5-3.5 3.5M11.5 8h-7" stroke="white" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" fill="none"/></svg>`;
+const ICON_ATTACH = `<svg width="15" height="15" viewBox="0 0 15 15" fill="currentColor" aria-hidden="true"><path d="M3.5 10.5v-6a4 4 0 0 1 8 0v7a2.5 2.5 0 0 1-5 0v-6a1 1 0 0 1 2 0v5.5"/></svg>`;
+
 function renderChat(): string {
   const enabledModels = models.filter((m) => m.enabled && (m.registered !== false));
 
-  // Build model options with context window hint and overflow warning
   const ctxTokens = currentContextTokens();
   const modelOpts = enabledModels
     .map((m) => {
       const ctxLimit = m.maxContextTokens ?? 0;
       const overflows = ctxLimit > 0 && ctxTokens > ctxLimit;
-      const ctxHint = ctxLimit > 0 ? ` (${Math.round(ctxLimit / 1000)}k ctx)` : "";
+      const ctxHint = ctxLimit > 0 ? ` (${Math.round(ctxLimit / 1000)}k)` : "";
       const label = esc(m.displayName || m.modelName) + ctxHint + (overflows ? " ⚠" : "");
       return `<option value="${esc(m.modelName)}" ${m.modelName === selectedModel ? "selected" : ""}>${label}</option>`;
     })
@@ -152,77 +189,155 @@ function renderChat(): string {
 
   const noModelsOpt =
     enabledModels.length === 0
-      ? '<option value="" disabled>— Add models in the Models tab —</option>'
+      ? '<option value="" disabled>— Add models in Models tab —</option>'
       : "";
 
-  // Context window overflow warning for selected model
   const selInfo = selectedModelInfo();
   const ctxLimit = selInfo?.maxContextTokens ?? 0;
   const ctxOverflow = ctxLimit > 0 && ctxTokens > ctxLimit;
-  const ctxBar = ctxTokens > 0
-    ? `<span style="font-size:10px;color:${ctxOverflow ? "var(--error)" : "var(--subtle)"};margin-left:6px" title="Estimated tokens in current conversation">~${ctxTokens.toLocaleString()} tok${ctxOverflow ? ` — exceeds ${Math.round(ctxLimit / 1000)}k limit` : ""}</span>`
-    : "";
 
-  let msgs = chatHistory.map((m) => {
+  // Build chat messages
+  let msgs = chatHistory.map((m, idx) => {
     if (m.role === "assistant") {
-      return `<div class="msg assistant"><div class="markdown-preview">${renderAssistantContent(m.content)}</div></div>`;
+      return `<div class="msg assistant" role="article" aria-label="Assistant message ${idx + 1}"><div class="markdown-preview">${renderAssistantContent(m.content)}</div></div>`;
     }
-    return `<div class="msg ${m.role}">${esc(m.content)}</div>`;
+    if (m.role === "system") {
+      return `<div class="msg system" role="status">${esc(m.content)}</div>`;
+    }
+    return `<div class="msg user" role="article" aria-label="Your message ${idx + 1}"><div class="msg-bubble">${esc(m.content)}</div></div>`;
   }).join("");
+
+  // Phase indicator — animated phases like Copilot/Cursor
   if (isLoading) {
-    msgs += `<div class="msg system"><span class="spinner"></span> Waiting for response...</div>`;
+    const phaseIcons: Record<string, string> = {
+      thinking: "🧠", reading: "📖", writing: "✍️", applying: "📝", running: "▶️", done: ""
+    };
+    const icon = phaseIcons[currentPhase] ?? "🧠";
+    const label = currentPhaseLabel || "Thinking…";
+    msgs += `<div class="msg phase-indicator" role="status" aria-live="polite" aria-label="${esc(label)}">
+      <div class="phase-row">
+        <span class="phase-icon" aria-hidden="true">${icon}</span>
+        <span class="phase-label">${esc(label)}</span>
+        <span class="phase-dots">
+          <span class="typing-dot" style="animation-delay:0ms"></span>
+          <span class="typing-dot" style="animation-delay:150ms"></span>
+          <span class="typing-dot" style="animation-delay:300ms"></span>
+        </span>
+      </div>
+    </div>`;
   }
 
   const preflightHtml = pendingEstimate ? renderPreFlight(pendingEstimate) : "";
+  const diffModal = pendingFileOps.length > 0 ? renderDiffModal(pendingFileOps) : "";
 
-  // Context overflow blocks send
   const canSend = enabledModels.length > 0
     && (selectedModel === "" || enabledModels.some((m) => m.modelName === selectedModel))
     && !ctxOverflow;
 
-  const attachedCount = pendingFilePaths.length + pendingBypassedPaths.length;
-  const attachLabel = attachedCount > 0 ? `Attach (${attachedCount})` : "Attach";
+  const totalAttached = pendingFilePaths.length + pendingBypassedPaths.length + pendingImages.length + mentionedFiles.length;
 
-  // @ mention chips
+  // @ mention chips row
   const mentionChips = mentionedFiles.length > 0
     ? `<div class="mention-chips" id="mention-chips">${mentionedFiles.map((f, i) =>
-        `<span class="mention-chip" data-idx="${i}">@${esc(f)}<button class="mention-chip-x" data-idx="${i}" title="Remove">×</button></span>`
+        `<span class="mention-chip">@${esc(f)}<button class="mention-chip-x" data-idx="${i}" title="Remove" aria-label="Remove ${esc(f)}">×</button></span>`
       ).join("")}</div>`
     : "";
 
   // @ mention dropdown
   const dropdownHtml = mentionDropdownVisible && mentionDropdownResults.length > 0
-    ? `<div class="mention-dropdown" id="mention-dropdown">${
+    ? `<div class="mention-dropdown" id="mention-dropdown" role="listbox" aria-label="File suggestions">${
         mentionDropdownResults.map((f, i) =>
-          `<div class="mention-option ${i === mentionDropdownIdx ? "selected" : ""}" data-idx="${i}" data-path="${esc(f)}">${esc(f)}</div>`
+          `<div class="mention-option ${i === mentionDropdownIdx ? "selected" : ""}" role="option" aria-selected="${i === mentionDropdownIdx}" tabindex="-1" data-idx="${i}" data-path="${esc(f)}">${esc(f)}</div>`
         ).join("")
       }</div>`
     : "";
 
-  // Pending file operations diff modal
-  const diffModal = pendingFileOps.length > 0 ? renderDiffModal(pendingFileOps) : "";
+  // Image preview strip
+  const imagePreviewHtml = pendingImages.length > 0
+    ? `<div class="composer-previews" aria-label="Attached images">${pendingImages.map((img, i) =>
+        `<div class="preview-item" title="${esc(img.name)}">
+          <img src="${img.dataUrl}" alt="${esc(img.name)}" class="preview-thumb" />
+          <button class="preview-remove" data-img-idx="${i}" aria-label="Remove ${esc(img.name)}">×</button>
+        </div>`
+      ).join("")}</div>`
+    : "";
+
+  // File attachment chips (non-image)
+  const fileChips = pendingFilePaths.length + pendingBypassedPaths.length > 0
+    ? `<div class="composer-file-chips">${[...pendingFilePaths, ...pendingBypassedPaths].map((f, i) =>
+        `<span class="file-chip${i >= pendingFilePaths.length ? " bypassed" : ""}" title="${esc(f)}">${esc(f.split(/[/\\]/).pop() ?? f)}<button class="file-chip-x" data-file-idx="${i}" aria-label="Remove ${esc(f)}">×</button></span>`
+      ).join("")}</div>`
+    : "";
+
+  const hasMsgs = chatHistory.length > 0;
+  const ctxTokLabel = ctxTokens > 0 ? `~${ctxTokens >= 1000 ? Math.round(ctxTokens / 100) / 10 + "k" : ctxTokens} tok` : "";
 
   return `
-    <div class="model-selector">
-      <label style="font-size:11px;color:var(--subtle)">Model:</label>
-      <select id="model-select">${noModelsOpt}${modelOpts}</select>
-      ${ctxBar}
-      <label style="font-size:10px;color:var(--subtle);margin-left:auto;display:flex;align-items:center;gap:3px;cursor:pointer" title="Agent mode: LLM can create and edit files">
-        <input type="checkbox" id="agent-mode-toggle" ${agentMode ? "checked" : ""} style="cursor:pointer"> Agent
-      </label>
-      <button type="button" class="btn btn-secondary btn-sm" id="attach-files-btn" title="Attach specific files">${esc(attachLabel)}</button>
-    </div>
-    ${ctxOverflow ? `<div style="font-size:11px;color:var(--error);padding:4px 8px;background:rgba(255,0,0,.08);border-radius:4px;margin-bottom:4px">Context too large for <b>${esc(selInfo?.displayName ?? selectedModel)}</b>. Clear chat or switch to a model with a larger context window.</div>` : ""}
-    <div class="chat-messages" id="chat-messages">${msgs || '<div class="empty-state">Start a conversation with AI.<br/>Type <b>@</b> to attach files. Enable <b>Agent</b> mode to let the AI create and edit files.</div>'}</div>
-    ${preflightHtml}
-    ${diffModal}
-    <div style="position:relative">
-      ${mentionChips}
-      ${dropdownHtml}
-      <div class="chat-input-row">
-        <textarea class="chat-input" id="chat-input" placeholder="Type your message… or @ to mention a file" rows="1"></textarea>
-        <button type="button" class="btn btn-primary" id="send-btn" ${isLoading || !canSend ? "disabled" : ""}>Send</button>
+    <div class="chat-wrap">
+      <!-- Model bar -->
+      <div class="model-bar" role="toolbar" aria-label="Chat controls">
+        <select id="model-select" aria-label="Select model" class="model-select-inline">${noModelsOpt}${modelOpts}</select>
+        ${ctxTokLabel ? `<span class="ctx-tok${ctxOverflow ? " ctx-overflow" : ""}" title="Estimated tokens in context">${esc(ctxTokLabel)}${ctxOverflow ? " ⚠" : ""}</span>` : ""}
+        <label class="agent-toggle" title="Agent mode: AI can create and edit files">
+          <input type="checkbox" id="agent-mode-toggle" ${agentMode ? "checked" : ""} aria-label="Agent mode">
+          <span>Agent</span>
+        </label>
+        ${agentMode ? `<label class="agent-toggle" title="Auto-apply: LLM edits files directly without approval" style="color:${autoApplyOps ? "var(--warning)" : "var(--subtle)"}">
+          <input type="checkbox" id="auto-apply-toggle" ${autoApplyOps ? "checked" : ""} aria-label="Auto-apply file edits">
+          <span>Auto-edit</span>
+        </label>` : ""}
+        ${hasMsgs ? `<button type="button" class="icon-btn" id="clear-chat-btn" title="Clear (Ctrl+Shift+K)" aria-label="Clear conversation">
+          <svg width="13" height="13" viewBox="0 0 13 13" fill="currentColor" aria-hidden="true"><path d="M1 1l11 11M12 1L1 12"/></svg>
+        </button>` : ""}
       </div>
+
+      ${ctxOverflow ? `<div role="alert" class="ctx-overflow-alert">Context too large for <b>${esc(selInfo?.displayName ?? selectedModel)}</b>. Clear chat or switch to a larger model.</div>` : ""}
+
+      <!-- Messages -->
+      <div class="chat-messages" id="chat-messages" role="log" aria-label="Conversation" aria-live="polite" aria-relevant="additions">
+        ${msgs || `<div class="empty-state" role="status">
+          <div class="empty-icon" aria-hidden="true">✦</div>
+          <div>How can I help you today?</div>
+          <div class="empty-hint">Type <kbd>@</kbd> to attach files · Enable <b>Agent</b> to create/edit files</div>
+        </div>`}
+      </div>
+
+      ${preflightHtml}
+      ${diffModal}
+
+      <!-- Composer -->
+      <div class="chat-composer" role="search" aria-label="Chat input">
+        ${mentionChips}
+        ${dropdownHtml}
+        ${imagePreviewHtml}
+        ${fileChips}
+        <div class="composer-input-row">
+          <textarea
+            class="composer-input"
+            id="chat-input"
+            placeholder="Message… (@ to attach files)"
+            rows="1"
+            aria-label="Chat message"
+            aria-multiline="true"
+            aria-haspopup="${mentionDropdownVisible ? "listbox" : "false"}"
+            aria-expanded="${mentionDropdownVisible}"
+            aria-controls="${mentionDropdownVisible ? "mention-dropdown" : ""}"
+            aria-autocomplete="list"
+            ${isLoading ? 'aria-disabled="true"' : ""}
+          ></textarea>
+        </div>
+        <div class="composer-footer">
+          <button type="button" class="icon-btn attach-btn" id="attach-files-btn" title="Attach files or images" aria-label="${totalAttached > 0 ? `Attach files (${totalAttached} attached)` : "Attach files"}">
+            ${ICON_ATTACH}${totalAttached > 0 ? `<span class="attach-badge">${totalAttached}</span>` : ""}
+          </button>
+          <div class="composer-footer-spacer"></div>
+          <button type="button" class="send-icon-btn" id="send-btn" ${isLoading || !canSend ? "disabled" : ""} aria-label="Send message" title="Send (Enter)">
+            ${ICON_SEND_FILLED}
+          </button>
+        </div>
+      </div>
+
+      <div class="sr-only" aria-live="polite" id="a11y-announce"></div>
     </div>
   `;
 }
@@ -291,55 +406,176 @@ function renderPreFlight(est: EstResult): string {
 
 // ── Providers ───────────────────────────────────────────────────────────
 
-function renderProviders(): string {
-  const list = providers.map((p) => `
-    <div class="card">
-      <div class="card-header">
-        <span class="card-title">${esc(p.name)}</span>
-        <span style="font-size:10px;color:${p.enabled ? "var(--success)" : "var(--error)"}">${p.enabled ? "enabled" : "disabled"}</span>
-      </div>
-      <div style="font-size:11px;color:var(--subtle)">${esc(p.baseUrl)}</div>
-      <div style="margin-top:6px;display:flex;gap:4px">
-        <button type="button" class="btn btn-secondary btn-sm toggle-provider" data-id="${p.id}" data-enabled="${p.enabled ? "1" : "0"}">${p.enabled ? "Disable" : "Enable"}</button>
-        <button type="button" class="btn btn-danger btn-sm delete-provider" data-id="${p.id}">Delete</button>
-      </div>
-    </div>
-  `).join("");
+// Provider icons as emoji (fallback for all providers)
+const PROVIDER_ICONS: Record<string, string> = {
+  openai: "🤖", anthropic: "🟠", "google-gemini": "💎", groq: "⚡",
+  mistral: "🌊", xai: "𝕏", deepseek: "🔵", together: "🤝",
+  perplexity: "🔍", ollama: "🦙"
+};
 
-  const presets = [
-    { name: "Groq (Llama free)", baseUrl: "https://api.groq.com/openai/v1", hint: "Get free API key at console.groq.com" },
-    { name: "OpenAI", baseUrl: "https://api.openai.com/v1", hint: "GPT-4, GPT-3.5" },
-    { name: "Anthropic", baseUrl: "https://api.anthropic.com", hint: "Claude" },
-    { name: "x.ai (Grok)", baseUrl: "https://api.x.ai/v1", hint: "Grok models" }
-  ];
-  const presetBtns = presets.map((pre) =>
-    `<button type="button" class="btn btn-secondary btn-sm preset-provider" data-name="${esc(pre.name)}" data-url="${esc(pre.baseUrl)}" title="${esc(pre.hint)}">${esc(pre.name)}</button>`
-  ).join(" ");
+function renderProviders(): string {
+  // Active providers list
+  const activeList = providers.length > 0 ? `
+    <div class="section-title">Active Providers</div>
+    <div class="provider-active-list">
+      ${providers.map((p) => `
+        <div class="provider-active-card">
+          <div class="provider-active-info">
+            <span class="provider-active-name">${esc(p.name)}</span>
+            <span class="provider-active-url">${esc(p.baseUrl)}</span>
+          </div>
+          <div class="provider-active-actions">
+            <span class="provider-status-dot" style="background:${p.enabled ? "var(--success)" : "var(--error)"}"></span>
+            <button type="button" class="btn btn-secondary btn-sm toggle-provider" data-id="${p.id}" data-enabled="${p.enabled ? "1" : "0"}">${p.enabled ? "Disable" : "Enable"}</button>
+            <button type="button" class="btn btn-danger btn-sm delete-provider" data-id="${p.id}">×</button>
+          </div>
+        </div>
+      `).join("")}
+    </div>
+  ` : "";
+
+  // Determine if we're in setup mode for a specific provider
+  const catalogEntry = catalog.find((c) => c.slug === setupProviderSlug);
+
+  if (setupProviderSlug && catalogEntry) {
+    // Step 2: API key + model selection for a specific provider
+    const modelCheckboxes = catalogEntry.models.map((m) => `
+      <label class="model-check-row" style="display:flex;align-items:flex-start;gap:6px;padding:5px 0;border-bottom:1px solid var(--border);cursor:pointer">
+        <input type="checkbox" class="catalog-model-check" data-model='${JSON.stringify({ modelName: m.modelName, displayName: m.displayName, inputCostPer1k: m.inputCostPer1k, outputCostPer1k: m.outputCostPer1k, maxContextTokens: m.maxContextTokens })}' ${selectedCatalogModels.has(m.modelName) ? "checked" : ""} style="margin-top:2px;accent-color:var(--btn-bg)" />
+        <div style="flex:1;min-width:0">
+          <div style="font-size:12px;font-weight:500">${esc(m.displayName)}</div>
+          <div style="font-size:10px;color:var(--subtle)">In: $${formatCost(m.inputCostPer1k)}/1k · Out: $${formatCost(m.outputCostPer1k)}/1k · ${Math.round(m.maxContextTokens / 1000)}k ctx</div>
+          ${m.tags?.length ? `<div style="margin-top:2px">${m.tags.map((t) => `<span style="font-size:9px;background:var(--input-bg);border:1px solid var(--border);border-radius:8px;padding:0 5px">${esc(t)}</span>`).join(" ")}</div>` : ""}
+        </div>
+      </label>
+    `).join("");
+
+    const isOllama = catalogEntry.slug === "ollama";
+
+    return `
+      ${activeList}
+      <div class="section-title" style="display:flex;align-items:center;gap:8px">
+        <button type="button" class="icon-btn" id="back-to-catalog-btn" aria-label="Back to catalog">←</button>
+        Set up ${esc(catalogEntry.name)}
+      </div>
+      <div class="card" style="margin-bottom:8px">
+        <div style="font-size:12px;font-weight:600;margin-bottom:6px">${esc(catalogEntry.name)}</div>
+        <div style="font-size:11px;color:var(--subtle);margin-bottom:8px">${esc(catalogEntry.description)}</div>
+        ${isOllama ? `<div style="font-size:11px;color:var(--warning);margin-bottom:8px">Ollama must be running locally (<code>ollama serve</code>). No API key needed.</div>` : `
+          <div class="form-group">
+            <label>API Key <a href="${esc(catalogEntry.authUrl)}" target="_blank" style="font-size:10px;margin-left:4px">Get key ↗</a></label>
+            <input type="password" id="setup-api-key" placeholder="Paste your API key" value="${esc(setupApiKey)}" />
+          </div>
+        `}
+        <div style="font-size:11px;font-weight:500;margin-bottom:4px">Select models to add:</div>
+        <div style="max-height:280px;overflow-y:auto">${modelCheckboxes}</div>
+        <div style="margin-top:10px;display:flex;gap:6px">
+          <button type="button" class="btn btn-primary" id="confirm-add-provider-btn">Add ${esc(catalogEntry.name)}</button>
+          <button type="button" class="btn btn-secondary btn-sm" id="back-to-catalog-btn2">Cancel</button>
+        </div>
+      </div>
+      <div style="display:flex;justify-content:flex-end">
+        <button type="button" class="btn btn-secondary btn-sm" id="configure-restrictions-btn">Restrict files/folders</button>
+      </div>
+    `;
+  }
+
+  // Step 1: Provider catalog tiles
+  const useSources = catalog.length > 0 ? catalog : BUILTIN_CATALOG;
+  const configuredSlugs = new Set(providers.map((p) => p.slug.toLowerCase().replace(/[^a-z0-9]/g, "-")));
+
+  const tiles = useSources.map((c) => {
+    const isConfigured = providers.some((p) => p.baseUrl === c.baseUrl || p.slug.toLowerCase().includes(c.slug.split("-")[0]));
+    const icon = PROVIDER_ICONS[c.slug] ?? "🔌";
+    return `
+      <button type="button" class="provider-tile ${isConfigured ? "provider-tile-active" : ""}" data-slug="${esc(c.slug)}" title="${esc(c.description)}">
+        <div class="provider-tile-icon">${icon}</div>
+        <div class="provider-tile-name">${esc(c.name)}</div>
+        ${isConfigured ? `<div class="provider-tile-badge">✓</div>` : ""}
+      </button>
+    `;
+  }).join("");
 
   return `
-    <div class="section-title">Your Providers</div>
-    ${list || '<div class="empty-state">No providers configured yet.<br/>Use a preset below or add manually.</div>'}
-    <div style="display:flex;justify-content:flex-end;margin:6px 0 2px 0">
-      <button type="button" class="btn btn-secondary btn-sm" id="configure-restrictions-btn">Restrict files/folders</button>
-    </div>
-    <div class="section-title">Quick add (preset)</div>
-    <div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:10px">${presetBtns}</div>
-    <div class="section-title">Add Provider</div>
-    <div class="form-group"><label>Name</label><input type="text" id="prov-name" placeholder="e.g. Groq, OpenAI" /></div>
-    <div class="form-group"><label>Base URL</label><input type="url" id="prov-url" placeholder="https://api.groq.com/openai/v1" /></div>
+    ${activeList}
+    <div class="section-title" style="margin-top:${providers.length ? "10px" : "0"}">Add Provider</div>
+    <div class="provider-tiles">${tiles}</div>
+
+    <div class="section-title" style="margin-top:10px">Manual Add</div>
+    <div class="form-group"><label>Name</label><input type="text" id="prov-name" placeholder="e.g. My OpenAI" /></div>
+    <div class="form-group"><label>Base URL</label><input type="url" id="prov-url" placeholder="https://api.openai.com/v1" /></div>
     <div class="form-group"><label>API Key</label><input type="password" id="prov-key" placeholder="Paste your API key" /></div>
-    <button type="button" class="btn btn-primary" id="add-provider-btn">Add Provider</button>
-    <p style="font-size:10px;color:var(--subtle);margin-top:8px">Groq: free Llama at <a href="https://console.groq.com" target="_blank">console.groq.com</a>. After adding, go to Models and add e.g. llama-3.1-8b-instant.</p>
+    <div style="display:flex;gap:6px;margin-top:4px">
+      <button type="button" class="btn btn-primary" id="add-provider-btn">Add</button>
+      <button type="button" class="btn btn-secondary btn-sm" id="configure-restrictions-btn">Restrict files</button>
+    </div>
   `;
+}
+
+// Builtin catalog fallback (when proxy is not reachable for catalog)
+const BUILTIN_CATALOG: CatalogProvider[] = [
+  { name: "OpenAI", slug: "openai", baseUrl: "https://api.openai.com/v1", authUrl: "https://platform.openai.com/api-keys", description: "GPT-4o, o3 reasoning", models: [
+    { modelName: "gpt-4o", displayName: "GPT-4o", inputCostPer1k: 0.005, outputCostPer1k: 0.015, maxContextTokens: 128000, tags: ["fast","vision"] },
+    { modelName: "gpt-4o-mini", displayName: "GPT-4o mini", inputCostPer1k: 0.00015, outputCostPer1k: 0.0006, maxContextTokens: 128000, tags: ["cheap"] },
+    { modelName: "o3-mini", displayName: "o3-mini", inputCostPer1k: 0.0011, outputCostPer1k: 0.0044, maxContextTokens: 200000, tags: ["reasoning"] }
+  ]},
+  { name: "Anthropic", slug: "anthropic", baseUrl: "https://api.anthropic.com", authUrl: "https://console.anthropic.com/settings/keys", description: "Claude 4 Opus, Sonnet", models: [
+    { modelName: "claude-opus-4-6", displayName: "Claude Opus 4.6", inputCostPer1k: 0.015, outputCostPer1k: 0.075, maxContextTokens: 200000, tags: ["powerful"] },
+    { modelName: "claude-sonnet-4-6", displayName: "Claude Sonnet 4.6", inputCostPer1k: 0.003, outputCostPer1k: 0.015, maxContextTokens: 200000 },
+    { modelName: "claude-haiku-4-5-20251001", displayName: "Claude Haiku 4.5", inputCostPer1k: 0.0008, outputCostPer1k: 0.004, maxContextTokens: 200000, tags: ["cheap"] }
+  ]},
+  { name: "Google Gemini", slug: "google-gemini", baseUrl: "https://generativelanguage.googleapis.com", authUrl: "https://aistudio.google.com/app/apikey", description: "Gemini 2.5 Pro, 1M ctx", models: [
+    { modelName: "gemini-2.5-pro-preview-03-25", displayName: "Gemini 2.5 Pro", inputCostPer1k: 0.00125, outputCostPer1k: 0.01, maxContextTokens: 1048576, tags: ["powerful","long-ctx"] },
+    { modelName: "gemini-2.0-flash", displayName: "Gemini 2.0 Flash", inputCostPer1k: 0.0001, outputCostPer1k: 0.0004, maxContextTokens: 1048576, tags: ["fast","cheap"] }
+  ]},
+  { name: "Groq", slug: "groq", baseUrl: "https://api.groq.com/openai/v1", authUrl: "https://console.groq.com/keys", description: "Free Llama on ultra-fast hardware", models: [
+    { modelName: "llama-3.3-70b-versatile", displayName: "Llama 3.3 70B", inputCostPer1k: 0.00059, outputCostPer1k: 0.00079, maxContextTokens: 128000 },
+    { modelName: "llama-3.1-8b-instant", displayName: "Llama 3.1 8B", inputCostPer1k: 0.00005, outputCostPer1k: 0.00008, maxContextTokens: 128000, tags: ["cheap","fast"] }
+  ]},
+  { name: "Mistral AI", slug: "mistral", baseUrl: "https://api.mistral.ai/v1", authUrl: "https://console.mistral.ai/api-keys", description: "Codestral for code, Mistral Large", models: [
+    { modelName: "codestral-latest", displayName: "Codestral", inputCostPer1k: 0.0003, outputCostPer1k: 0.0009, maxContextTokens: 256000, tags: ["code"] },
+    { modelName: "mistral-large-latest", displayName: "Mistral Large", inputCostPer1k: 0.002, outputCostPer1k: 0.006, maxContextTokens: 128000 }
+  ]},
+  { name: "x.ai (Grok)", slug: "xai", baseUrl: "https://api.x.ai/v1", authUrl: "https://console.x.ai", description: "Grok 3 with real-time web", models: [
+    { modelName: "grok-3", displayName: "Grok 3", inputCostPer1k: 0.003, outputCostPer1k: 0.015, maxContextTokens: 131072 },
+    { modelName: "grok-3-mini", displayName: "Grok 3 Mini", inputCostPer1k: 0.0003, outputCostPer1k: 0.0005, maxContextTokens: 131072, tags: ["cheap"] }
+  ]},
+  { name: "DeepSeek", slug: "deepseek", baseUrl: "https://api.deepseek.com/v1", authUrl: "https://platform.deepseek.com/api_keys", description: "DeepSeek V3, R1 Reasoner", models: [
+    { modelName: "deepseek-chat", displayName: "DeepSeek V3", inputCostPer1k: 0.00027, outputCostPer1k: 0.0011, maxContextTokens: 64000, tags: ["cheap"] },
+    { modelName: "deepseek-reasoner", displayName: "DeepSeek R1", inputCostPer1k: 0.00055, outputCostPer1k: 0.00219, maxContextTokens: 64000, tags: ["reasoning"] }
+  ]},
+  { name: "Together AI", slug: "together", baseUrl: "https://api.together.xyz/v1", authUrl: "https://api.together.ai/settings/api-keys", description: "Open-source models", models: [
+    { modelName: "meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo", displayName: "Llama 3.1 70B Turbo", inputCostPer1k: 0.00088, outputCostPer1k: 0.00088, maxContextTokens: 131072 },
+    { modelName: "deepseek-ai/DeepSeek-V3", displayName: "DeepSeek V3", inputCostPer1k: 0.00135, outputCostPer1k: 0.00135, maxContextTokens: 128000 }
+  ]},
+  { name: "Perplexity", slug: "perplexity", baseUrl: "https://api.perplexity.ai", authUrl: "https://www.perplexity.ai/settings/api", description: "Sonar with web search", models: [
+    { modelName: "sonar-pro", displayName: "Sonar Pro", inputCostPer1k: 0.003, outputCostPer1k: 0.015, maxContextTokens: 200000, tags: ["search"] },
+    { modelName: "sonar", displayName: "Sonar", inputCostPer1k: 0.001, outputCostPer1k: 0.001, maxContextTokens: 128000, tags: ["search","cheap"] }
+  ]},
+  { name: "Ollama (Local)", slug: "ollama", baseUrl: "http://localhost:11434", authUrl: "https://ollama.com/download", description: "Local models, fully private", models: [
+    { modelName: "llama3.2", displayName: "Llama 3.2 3B", inputCostPer1k: 0, outputCostPer1k: 0, maxContextTokens: 128000, tags: ["free","local"] },
+    { modelName: "qwen2.5-coder:7b", displayName: "Qwen 2.5 Coder 7B", inputCostPer1k: 0, outputCostPer1k: 0, maxContextTokens: 32768, tags: ["code","free"] }
+  ]}
+];
+
+function formatCost(n: number): string {
+  if (n === 0) return "free";
+  if (n < 0.001) return n.toFixed(6);
+  if (n < 0.01) return n.toFixed(4);
+  return n.toFixed(3);
 }
 
 // ── Models ───────────────────────────────────────────────────────────────
 
 function renderModels(): string {
-  if (models.length === 0 && providers.length === 0) {
-    return '<div class="empty-state">Add a provider first, then register models.</div>';
+  if (providers.length === 0) {
+    return '<div class="empty-state" style="padding:20px">Add a provider first (go to Providers tab).</div>';
   }
 
+  // Build registered model set for deduplication check
+  const registeredModelNames = new Set(models.map((m) => m.modelName));
+
+  // Active models grouped by provider
   const grouped = new Map<number, { provider: Provider | undefined; models: Model[] }>();
   for (const m of models) {
     if (!grouped.has(m.providerId)) {
@@ -348,35 +584,70 @@ function renderModels(): string {
     grouped.get(m.providerId)!.models.push(m);
   }
 
-  let html = "";
-  for (const [, group] of grouped) {
-    html += `<div class="section-title">${esc(group.provider?.name ?? "Unknown")}</div>`;
-    for (const m of group.models) {
-      html += `
-        <div class="card">
-          <div class="card-header">
-            <span class="card-title">${esc(m.displayName || m.modelName)}</span>
-            <span style="font-size:10px;color:${m.enabled ? "var(--success)" : "var(--subtle)"}">${m.enabled ? "active" : "disabled"}</span>
-          </div>
-          <div style="font-size:11px;color:var(--subtle)">In: $${m.inputCostPer1k}/1k tok &nbsp;|&nbsp; Out: $${m.outputCostPer1k}/1k tok</div>
-        </div>`;
+  let activeHtml = "";
+  if (models.length > 0) {
+    activeHtml += `<div class="section-title">Registered Models</div>`;
+    for (const [, group] of grouped) {
+      activeHtml += `<div style="font-size:10px;font-weight:600;color:var(--subtle);text-transform:uppercase;letter-spacing:.5px;margin:6px 0 3px">${esc(group.provider?.name ?? "Unknown")}</div>`;
+      for (const m of group.models) {
+        const costIn = formatCost(m.inputCostPer1k);
+        const costOut = formatCost(m.outputCostPer1k);
+        const ctx = m.maxContextTokens && m.maxContextTokens > 0 ? `${Math.round(m.maxContextTokens / 1000)}k ctx` : "";
+        activeHtml += `
+          <div class="model-row">
+            <div class="model-row-info">
+              <span class="model-row-name">${esc(m.displayName || m.modelName)}</span>
+              <span class="model-row-cost">$${costIn} / $${costOut} per 1k ${ctx ? `· ${ctx}` : ""}</span>
+            </div>
+            <span class="model-status-dot" style="background:${m.enabled ? "var(--success)" : "var(--subtle)"}"></span>
+          </div>`;
+      }
     }
   }
 
-  if (providers.length > 0) {
-    const provOpts = providers.map((p) => `<option value="${p.id}">${esc(p.name)}</option>`).join("");
-    html += `
-      <div class="section-title">Add Model</div>
-      <div class="form-group"><label>Provider</label><select id="model-provider">${provOpts}</select></div>
-      <div class="form-group"><label>Model Name</label><input type="text" id="model-name" placeholder="e.g. llama-3.1-8b-instant (Groq), gpt-4 (OpenAI)" /></div>
-      <div class="form-group"><label>Input Cost / 1k tokens</label><input type="number" id="model-input-cost" step="0.0001" value="0" /></div>
-      <div class="form-group"><label>Output Cost / 1k tokens</label><input type="number" id="model-output-cost" step="0.0001" value="0" /></div>
-      <button type="button" class="btn btn-primary" id="add-model-btn">Add Model</button>
-      <p style="font-size:10px;color:var(--subtle);margin-top:6px"><strong>Groq:</strong> use exact name e.g. <code>llama-3.1-8b-instant</code>, <code>llama-3.1-70b-versatile</code>, <code>mixtral-8x7b-32768</code> (not &quot;llama-1&quot;). <strong>OpenAI:</strong> gpt-4, gpt-3.5-turbo.</p>
-    `;
+  // Catalog section — show models from catalog for each provider that's configured
+  let catalogHtml = "";
+  const useSources = catalog.length > 0 ? catalog : BUILTIN_CATALOG;
+  const matchedCatalogProviders = useSources.filter((cp) =>
+    providers.some((p) => p.baseUrl === cp.baseUrl || p.name.toLowerCase().includes(cp.slug.split("-")[0]))
+  );
+
+  if (matchedCatalogProviders.length > 0) {
+    catalogHtml += `<div class="section-title" style="margin-top:10px">Add More Models</div>`;
+    for (const cp of matchedCatalogProviders) {
+      const matchedProvider = providers.find((p) => p.baseUrl === cp.baseUrl || p.name.toLowerCase().includes(cp.slug.split("-")[0]));
+      if (!matchedProvider) continue;
+      const newModels = cp.models.filter((m) => !registeredModelNames.has(m.modelName));
+      if (newModels.length === 0) continue;
+      catalogHtml += `<div style="font-size:10px;font-weight:600;color:var(--subtle);text-transform:uppercase;letter-spacing:.5px;margin:6px 0 3px">${esc(cp.name)}</div>`;
+      for (const m of newModels) {
+        catalogHtml += `
+          <div class="model-catalog-row">
+            <div class="model-row-info">
+              <span class="model-row-name">${esc(m.displayName)}</span>
+              <span class="model-row-cost">$${formatCost(m.inputCostPer1k)} / $${formatCost(m.outputCostPer1k)} per 1k${m.maxContextTokens ? ` · ${Math.round(m.maxContextTokens / 1000)}k ctx` : ""}</span>
+              ${m.tags?.length ? `<span class="model-row-tags">${m.tags.map((t) => `<span class="model-tag">${esc(t)}</span>`).join("")}</span>` : ""}
+            </div>
+            <button type="button" class="btn btn-secondary btn-sm catalog-add-model" data-provider-id="${matchedProvider.id}" data-model='${JSON.stringify({ modelName: m.modelName, displayName: m.displayName, inputCostPer1k: m.inputCostPer1k, outputCostPer1k: m.outputCostPer1k, maxContextTokens: m.maxContextTokens })}'>+ Add</button>
+          </div>`;
+      }
+    }
   }
 
-  return html;
+  // Manual add form
+  const provOpts = providers.map((p) => `<option value="${p.id}">${esc(p.name)}</option>`).join("");
+  const manualForm = `
+    <div class="section-title" style="margin-top:10px">Manual Add</div>
+    <div class="form-group"><label>Provider</label><select id="model-provider">${provOpts}</select></div>
+    <div class="form-group"><label>Model ID</label><input type="text" id="model-name" placeholder="e.g. gpt-4o-mini" /></div>
+    <div style="display:flex;gap:8px">
+      <div class="form-group" style="flex:1"><label>Input $/1k</label><input type="number" id="model-input-cost" step="0.0001" value="0" /></div>
+      <div class="form-group" style="flex:1"><label>Output $/1k</label><input type="number" id="model-output-cost" step="0.0001" value="0" /></div>
+    </div>
+    <button type="button" class="btn btn-primary btn-sm" id="add-model-btn">Add</button>
+  `;
+
+  return activeHtml + catalogHtml + manualForm;
 }
 
 // ── Credits ─────────────────────────────────────────────────────────────
@@ -466,6 +737,17 @@ function bindEvents(): void {
   const sendBtn = document.getElementById("send-btn") as HTMLButtonElement | null;
 
   chatInput?.addEventListener("keydown", (e) => {
+    // Mention dropdown navigation takes priority
+    if (mentionDropdownVisible) {
+      if (e.key === "ArrowDown") { e.preventDefault(); mentionDropdownIdx = Math.min(mentionDropdownIdx + 1, mentionDropdownResults.length - 1); render(); return; }
+      if (e.key === "ArrowUp")   { e.preventDefault(); mentionDropdownIdx = Math.max(mentionDropdownIdx - 1, 0); render(); return; }
+      if (e.key === "Enter" || e.key === "Tab") {
+        e.preventDefault();
+        if (mentionDropdownResults[mentionDropdownIdx]) { acceptMentionOption(mentionDropdownResults[mentionDropdownIdx]); }
+        return;
+      }
+      if (e.key === "Escape") { mentionDropdownVisible = false; mentionAtStart = -1; render(); return; }
+    }
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
       triggerSend();
@@ -523,6 +805,73 @@ function bindEvents(): void {
     });
   });
 
+  // Provider tile clicks — enter setup flow
+  document.querySelectorAll<HTMLButtonElement>(".provider-tile").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      setupProviderSlug = btn.dataset.slug ?? "";
+      setupApiKey = "";
+      const useSources = catalog.length > 0 ? catalog : BUILTIN_CATALOG;
+      const entry = useSources.find((c) => c.slug === setupProviderSlug);
+      // Pre-select all models
+      selectedCatalogModels = new Set(entry?.models.map((m) => m.modelName) ?? []);
+      render();
+    });
+  });
+
+  document.getElementById("back-to-catalog-btn")?.addEventListener("click", () => {
+    setupProviderSlug = "";
+    render();
+  });
+  document.getElementById("back-to-catalog-btn2")?.addEventListener("click", () => {
+    setupProviderSlug = "";
+    render();
+  });
+
+  // Catalog model checkboxes
+  document.querySelectorAll<HTMLInputElement>(".catalog-model-check").forEach((cb) => {
+    cb.addEventListener("change", () => {
+      let modelData: { modelName: string } | null = null;
+      try { modelData = JSON.parse(cb.dataset.model ?? "null"); } catch { /* ignore */ }
+      if (!modelData) return;
+      if (cb.checked) {
+        selectedCatalogModels.add(modelData.modelName);
+      } else {
+        selectedCatalogModels.delete(modelData.modelName);
+      }
+    });
+  });
+
+  document.getElementById("setup-api-key")?.addEventListener("input", (e) => {
+    setupApiKey = (e.target as HTMLInputElement).value;
+  });
+
+  document.getElementById("confirm-add-provider-btn")?.addEventListener("click", () => {
+    const useSources = catalog.length > 0 ? catalog : BUILTIN_CATALOG;
+    const entry = useSources.find((c) => c.slug === setupProviderSlug);
+    if (!entry) return;
+    const isOllama = entry.slug === "ollama";
+    const apiKey = isOllama ? "ollama-local" : setupApiKey.trim();
+    if (!isOllama && !apiKey) { showToast("Please enter an API key."); return; }
+    const chosenModels = entry.models.filter((m) => selectedCatalogModels.has(m.modelName));
+    if (chosenModels.length === 0) { showToast("Select at least one model."); return; }
+    vscode.postMessage({ type: "addProviderWithModels", provider: { name: entry.name, apiKey, baseUrl: entry.baseUrl }, models: chosenModels });
+    setupProviderSlug = "";
+    setupApiKey = "";
+    selectedCatalogModels = new Set();
+    render();
+  });
+
+  // Catalog quick-add model buttons (Models tab)
+  document.querySelectorAll<HTMLButtonElement>(".catalog-add-model").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const providerId = Number(btn.dataset.providerId);
+      let modelData: CatalogModel | null = null;
+      try { modelData = JSON.parse(btn.dataset.model ?? "null"); } catch { /* ignore */ }
+      if (!modelData) return;
+      vscode.postMessage({ type: "addModel", providerId, modelName: modelData.modelName, displayName: modelData.displayName, inputCostPer1k: modelData.inputCostPer1k, outputCostPer1k: modelData.outputCostPer1k });
+    });
+  });
+
   document.getElementById("add-provider-btn")?.addEventListener("click", () => {
     const name = (document.getElementById("prov-name") as HTMLInputElement).value.trim();
     const apiKey = (document.getElementById("prov-key") as HTMLInputElement).value.trim();
@@ -539,9 +888,46 @@ function bindEvents(): void {
     vscode.postMessage({ type: "attachFiles" });
   });
 
+  document.getElementById("clear-chat-btn")?.addEventListener("click", () => clearChat());
+
+  // Image preview remove buttons
+  document.querySelectorAll<HTMLButtonElement>(".preview-remove").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const idx = Number(btn.dataset.imgIdx);
+      pendingImages = pendingImages.filter((_, i) => i !== idx);
+      render();
+    });
+  });
+
+  // File chip remove buttons
+  document.querySelectorAll<HTMLButtonElement>(".file-chip-x").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const idx = Number(btn.dataset.fileIdx);
+      const allFiles = [...pendingFilePaths, ...pendingBypassedPaths];
+      allFiles.splice(idx, 1);
+      pendingFilePaths = allFiles.slice(0, pendingFilePaths.length > idx ? pendingFilePaths.length - 1 : pendingFilePaths.length);
+      pendingBypassedPaths = allFiles.slice(pendingFilePaths.length);
+      render();
+    });
+  });
+
+  // Keyboard shortcut: Ctrl+Shift+K = clear chat (mirrors VS Code / Copilot)
+  document.addEventListener("keydown", (e) => {
+    if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key === "K") {
+      e.preventDefault();
+      clearChat();
+    }
+  }, { once: true }); // re-registered on every render via bindEvents
+
   // Agent mode toggle
   document.getElementById("agent-mode-toggle")?.addEventListener("change", (e) => {
     agentMode = (e.target as HTMLInputElement).checked;
+    if (!agentMode) autoApplyOps = false;
+    render();
+  });
+
+  document.getElementById("auto-apply-toggle")?.addEventListener("change", (e) => {
+    autoApplyOps = (e.target as HTMLInputElement).checked;
   });
 
   // Diff modal accept / reject
@@ -584,21 +970,6 @@ function bindEvents(): void {
       e.preventDefault(); // prevent blur before click
       acceptMentionOption(el.dataset.path ?? "");
     });
-  });
-
-  // @ mention input handling
-  const chatInput = document.getElementById("chat-input") as HTMLTextAreaElement | null;
-  chatInput?.addEventListener("keydown", (e) => {
-    if (mentionDropdownVisible) {
-      if (e.key === "ArrowDown") { e.preventDefault(); mentionDropdownIdx = Math.min(mentionDropdownIdx + 1, mentionDropdownResults.length - 1); render(); return; }
-      if (e.key === "ArrowUp")   { e.preventDefault(); mentionDropdownIdx = Math.max(mentionDropdownIdx - 1, 0); render(); return; }
-      if (e.key === "Enter" || e.key === "Tab") {
-        e.preventDefault();
-        if (mentionDropdownResults[mentionDropdownIdx]) { acceptMentionOption(mentionDropdownResults[mentionDropdownIdx]); }
-        return;
-      }
-      if (e.key === "Escape") { mentionDropdownVisible = false; mentionAtStart = -1; render(); return; }
-    }
   });
 
   document.querySelectorAll<HTMLButtonElement>(".delete-provider").forEach((btn) => {
@@ -656,7 +1027,7 @@ function acceptMentionOption(filePath: string): void {
     mentionedFiles.push(filePath);
   }
 
-  // Remove @query from the textarea
+  // Remove @query from the textarea without a full re-render
   const input = document.getElementById("chat-input") as HTMLTextAreaElement | null;
   if (input && mentionAtStart !== -1) {
     const cur = input.selectionStart ?? 0;
@@ -667,7 +1038,98 @@ function acceptMentionOption(filePath: string): void {
   mentionDropdownVisible = false;
   mentionAtStart = -1;
   mentionDropdownResults = [];
-  render();
+
+  // Remove dropdown from DOM without re-rendering the full page (preserves focus)
+  document.getElementById("mention-dropdown")?.remove();
+
+  // Update chip bar surgically
+  updateMentionChips();
+  input?.focus();
+}
+
+function updateMentionChips(): void {
+  const container = document.getElementById("mention-chips");
+  if (!container && mentionedFiles.length === 0) return;
+
+  if (mentionedFiles.length === 0) {
+    container?.remove();
+    return;
+  }
+
+  const html = mentionedFiles.map((f, i) =>
+    `<span class="mention-chip" data-idx="${i}">@${esc(f)}<button class="mention-chip-x" data-idx="${i}" aria-label="Remove ${esc(f)}" title="Remove">×</button></span>`
+  ).join("");
+
+  if (container) {
+    container.innerHTML = html;
+  } else {
+    // Create the chip bar just before the input row
+    const inputRow = document.querySelector(".chat-input-row");
+    if (inputRow) {
+      const div = document.createElement("div");
+      div.id = "mention-chips";
+      div.className = "mention-chips";
+      div.innerHTML = html;
+      inputRow.parentElement?.insertBefore(div, inputRow);
+    }
+  }
+
+  // Re-bind chip remove buttons
+  document.querySelectorAll<HTMLButtonElement>(".mention-chip-x").forEach((btn) => {
+    btn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      const idx = Number(btn.dataset.idx);
+      mentionedFiles = mentionedFiles.filter((_, i) => i !== idx);
+      updateMentionChips();
+    });
+  });
+}
+
+/** Typewriter animation: progressively reveals content then does final markdown render */
+function startTypewriter(fullContent: string, modelUsed: string): void {
+  if (typewriterTimer) { clearInterval(typewriterTimer); typewriterTimer = null; }
+
+  const msgs = document.getElementById("chat-messages");
+  if (!msgs) {
+    chatHistory.push({ role: "assistant", content: fullContent });
+    if (modelUsed) chatHistory.push({ role: "system", content: `↳ ${modelUsed}` });
+    render();
+    (document.getElementById("chat-input") as HTMLTextAreaElement | null)?.focus();
+    return;
+  }
+
+  // Remove loading indicators
+  document.querySelector(".phase-indicator")?.remove();
+  document.querySelector(".typing-indicator")?.remove();
+
+  // Create streaming placeholder
+  const div = document.createElement("div");
+  div.className = "msg assistant";
+  div.setAttribute("role", "article");
+  div.setAttribute("aria-label", "Assistant message");
+  div.innerHTML = `<div class="markdown-preview"><span id="stream-text-live" style="white-space:pre-wrap"></span><span class="stream-cursor" aria-hidden="true">▋</span></div>`;
+  msgs.appendChild(div);
+  msgs.scrollTop = msgs.scrollHeight;
+
+  let pos = 0;
+  typewriterTimer = setInterval(() => {
+    if (pos >= fullContent.length) {
+      clearInterval(typewriterTimer!);
+      typewriterTimer = null;
+      div.remove();
+      chatHistory.push({ role: "assistant", content: fullContent });
+      if (modelUsed) chatHistory.push({ role: "system", content: `↳ ${modelUsed}` });
+      render();
+      announce(`Response received from ${modelUsed || "assistant"}`);
+      (document.getElementById("chat-input") as HTMLTextAreaElement | null)?.focus();
+      return;
+    }
+    const chunkSize = Math.floor(Math.random() * 10) + 3;
+    pos = Math.min(pos + chunkSize, fullContent.length);
+    const el = document.getElementById("stream-text-live");
+    if (el) el.textContent = fullContent.slice(0, pos);
+    msgs.scrollTop = msgs.scrollHeight;
+  }, 12);
 }
 
 function triggerSend(): void {
@@ -745,9 +1207,32 @@ function sendDirectly(messages: ChatMsg[]): void {
   const allFilePaths = [...new Set([...pendingFilePaths, ...mentionedFiles])];
   pendingFilePaths = [];
   pendingBypassedPaths = [];
+  pendingImages = [];
   mentionedFiles = [];
   render();
+  // Re-focus the textarea after render so the user can type again immediately
+  (document.getElementById("chat-input") as HTMLTextAreaElement | null)?.focus();
   vscode.postMessage({ type: "chat", model: selectedModel, messages, filePaths: allFilePaths, bypassedFilePaths: bypassedPaths });
+}
+
+function clearChat(): void {
+  chatHistory = [];
+  pendingEstimate = null;
+  pendingMessages = [];
+  pendingFilePaths = [];
+  pendingBypassedPaths = [];
+  pendingImages = [];
+  mentionedFiles = [];
+  pendingFileOps = [];
+  render();
+  announce("Conversation cleared");
+  (document.getElementById("chat-input") as HTMLTextAreaElement | null)?.focus();
+}
+
+/** Post a message to the sr-only live region so screen readers announce it */
+function announce(text: string): void {
+  const el = document.getElementById("a11y-announce");
+  if (el) { el.textContent = ""; requestAnimationFrame(() => { el.textContent = text; }); }
 }
 
 function showToast(msg: string): void {
@@ -800,13 +1285,13 @@ function renderAssistantContent(content: string): string {
     const blockId = `cb-${codeBlockCounter++}`;
     codeBlockStore.set(blockId, code);
     parts.push(`
-      <div class="code-block-wrapper">
+      <div class="code-block-wrapper" role="region" aria-label="${esc(lang)} code block">
         <div class="code-block-header">
-          <span class="code-block-lang">${esc(lang)}</span>
-          <div class="code-block-actions">
-            <button type="button" class="btn btn-sm btn-primary cb-insert" data-id="${blockId}" title="Insert at cursor">Insert</button>
-            <button type="button" class="btn btn-sm btn-secondary cb-replace" data-id="${blockId}" title="Replace selection">Replace</button>
-            <button type="button" class="btn btn-sm btn-secondary cb-copy" data-id="${blockId}" title="Copy to clipboard">Copy</button>
+          <span class="code-block-lang" aria-hidden="true">${esc(lang)}</span>
+          <div class="code-block-actions" role="group" aria-label="Code actions">
+            <button type="button" class="btn btn-sm btn-primary cb-insert" data-id="${blockId}" title="Insert at cursor" aria-label="Insert ${esc(lang)} code at cursor">Insert</button>
+            <button type="button" class="btn btn-sm btn-secondary cb-replace" data-id="${blockId}" title="Replace selection" aria-label="Replace selection with ${esc(lang)} code">Replace</button>
+            <button type="button" class="btn btn-sm btn-secondary cb-copy" data-id="${blockId}" title="Copy to clipboard" aria-label="Copy ${esc(lang)} code">Copy</button>
           </div>
         </div>
         <pre class="code-block-pre"><code>${esc(code)}</code></pre>
@@ -846,6 +1331,7 @@ window.addEventListener("message", (event) => {
         // Load initial lists after login
         vscode.postMessage({ type: "loadProviders" });
         vscode.postMessage({ type: "loadModels" });
+        vscode.postMessage({ type: "loadCatalog" });
       }
       render();
       break;
@@ -857,7 +1343,8 @@ window.addEventListener("message", (event) => {
       break;
 
     case "chatResponse": {
-      isLoading = false;
+      currentPhase = "done";
+      currentPhaseLabel = "";
       const resp = msg.data as {
         choices?: Array<{ message?: { content: string } }>;
         _firewall?: { action?: string; redacted_messages?: Array<{ role: string; content: string }>; secrets_found?: number; pii_found?: number; model_used?: string };
@@ -889,17 +1376,45 @@ window.addEventListener("message", (event) => {
         }
       }
       const content = resp.choices?.[0]?.message?.content ?? "(no response)";
-      chatHistory.push({ role: "assistant", content });
       const modelUsed = fw?.model_used ?? selectedModel;
-      if (modelUsed) {
-        chatHistory.push({ role: "system", content: `↳ ${modelUsed}` });
+      // Typewriter animation: progressively shows text then renders final markdown
+      isLoading = false;
+      startTypewriter(content, modelUsed);
+      break;
+    }
+
+    case "agentPhase": {
+      currentPhase = msg.phase as string;
+      currentPhaseLabel = msg.label as string;
+      // Surgical update — avoid full re-render while loading
+      const phaseIcons: Record<string, string> = {
+        thinking: "🧠", reading: "📖", writing: "✍️", applying: "📝", running: "▶️", done: ""
+      };
+      const labelEl = document.querySelector<HTMLElement>(".phase-indicator .phase-label");
+      const iconEl = document.querySelector<HTMLElement>(".phase-indicator .phase-icon");
+      if (labelEl && iconEl) {
+        labelEl.textContent = currentPhaseLabel || "Thinking…";
+        iconEl.textContent = phaseIcons[currentPhase] ?? "🧠";
+      } else {
+        render();
       }
+      break;
+    }
+
+    case "commandOutput": {
+      const cmd = msg.command as string;
+      const output = msg.output as string;
+      const exitCode = msg.exitCode as number;
+      const statusIcon = exitCode === 0 ? "✅" : "❌";
+      chatHistory.push({ role: "system", content: `${statusIcon} \`${cmd}\`\n\`\`\`\n${output || "(no output)"}\n\`\`\`` });
       render();
       break;
     }
 
     case "chatError":
       isLoading = false;
+      currentPhase = "";
+      currentPhaseLabel = "";
       chatHistory.push({ role: "system", content: `Error: ${msg.message}` });
       render();
       break;
@@ -921,7 +1436,8 @@ window.addEventListener("message", (event) => {
       if (enabled.length > 0) {
         const currentValid = enabled.some((m) => m.modelName === selectedModel);
         if (!currentValid) {
-          selectedModel = enabled[0].modelName;
+          const defaultValid = configuredDefaultModel && enabled.some((m) => m.modelName === configuredDefaultModel);
+          selectedModel = defaultValid ? configuredDefaultModel : enabled[0].modelName;
         }
       } else {
         selectedModel = "";
@@ -949,9 +1465,16 @@ window.addEventListener("message", (event) => {
       render();
       break;
 
+    case "catalog": {
+      catalog = (msg.data as CatalogProvider[]) ?? [];
+      render();
+      break;
+    }
+
     case "attachedFiles": {
       pendingFilePaths = (msg.safeFiles as string[]) ?? [];
       pendingBypassedPaths = (msg.bypassedFiles as string[]) ?? [];
+      pendingImages = (msg.imageFiles as { name: string; dataUrl: string }[]) ?? [];
       render();
       break;
     }
@@ -959,24 +1482,36 @@ window.addEventListener("message", (event) => {
     case "mentionSearchResults": {
       mentionDropdownResults = (msg.results as string[]) ?? [];
       mentionDropdownIdx = 0;
-      // Re-render only the dropdown overlay, not the full view, to avoid losing cursor
-      const dd = document.getElementById("mention-dropdown");
-      if (!dd && mentionDropdownResults.length > 0) {
-        render(); // first time — needs full render to inject dropdown
-      } else if (dd) {
-        dd.innerHTML = mentionDropdownResults.map((f, i) =>
-          `<div class="mention-option ${i === mentionDropdownIdx ? "selected" : ""}" data-idx="${i}" data-path="${esc(f)}">${esc(f)}</div>`
-        ).join("");
-        // re-bind option clicks
-        dd.querySelectorAll<HTMLDivElement>(".mention-option").forEach((el) => {
-          el.addEventListener("mousedown", (e) => {
-            e.preventDefault();
-            acceptMentionOption(el.dataset.path ?? "");
-          });
-        });
-      } else if (mentionDropdownResults.length === 0 && mentionDropdownVisible) {
+      // Surgical dropdown update — never re-render the full page while the user is typing.
+      // Instead, find or create the dropdown element and patch it in place.
+      const inputEl = document.getElementById("chat-input") as HTMLTextAreaElement | null;
+      const inputParent = inputEl?.parentElement ?? null;
+      let dd = document.getElementById("mention-dropdown");
+
+      if (mentionDropdownResults.length === 0) {
+        // No results — remove dropdown if present
+        dd?.remove();
         mentionDropdownVisible = false;
-        render();
+      } else {
+        const optHtml = mentionDropdownResults.map((f, i) =>
+          `<div class="mention-option ${i === mentionDropdownIdx ? "selected" : ""}" role="option" aria-selected="${i === mentionDropdownIdx}" data-idx="${i}" data-path="${esc(f)}">${esc(f)}</div>`
+        ).join("");
+
+        if (!dd && inputParent) {
+          // Create dropdown for the first time
+          dd = document.createElement("div");
+          dd.id = "mention-dropdown";
+          dd.className = "mention-dropdown";
+          dd.setAttribute("role", "listbox");
+          dd.setAttribute("aria-label", "File suggestions");
+          inputParent.insertBefore(dd, inputEl);
+        }
+        if (dd) {
+          dd.innerHTML = optHtml;
+          dd.querySelectorAll<HTMLDivElement>(".mention-option").forEach((el) => {
+            el.addEventListener("mousedown", (e) => { e.preventDefault(); acceptMentionOption(el.dataset.path ?? ""); });
+          });
+        }
       }
       break;
     }
@@ -984,7 +1519,13 @@ window.addEventListener("message", (event) => {
     case "fileOperations": {
       const ops = (msg.operations as FileOp[]) ?? [];
       if (ops.length > 0) {
-        pendingFileOps = ops;
+        if (autoApplyOps && agentMode) {
+          // Auto-apply mode: send all ops directly to extension without showing diff modal
+          vscode.postMessage({ type: "applyAllFileOps", operations: ops.map((op) => ({ opType: op.type, filePath: op.path, content: op.content })) });
+          pendingFileOps = [];
+        } else {
+          pendingFileOps = ops;
+        }
         render();
       }
       break;

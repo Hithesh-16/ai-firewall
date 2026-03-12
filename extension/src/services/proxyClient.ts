@@ -343,3 +343,40 @@ export async function getUsageSummary(): Promise<{
     }>;
   };
 }
+
+export type CatalogModel = {
+  modelName: string;
+  displayName: string;
+  inputCostPer1k: number;
+  outputCostPer1k: number;
+  maxContextTokens: number;
+  tags?: string[];
+};
+
+export type CatalogProvider = {
+  name: string;
+  slug: string;
+  baseUrl: string;
+  authUrl: string;
+  description: string;
+  models: CatalogModel[];
+};
+
+export async function getModelCatalog(): Promise<CatalogProvider[]> {
+  const res = await request("GET", "/api/models/catalog");
+  return (res.data ?? []) as CatalogProvider[];
+}
+
+export async function addModelWithMeta(
+  providerId: number,
+  model: CatalogModel
+): Promise<ModelInfo> {
+  const res = await request("POST", `/api/providers/${providerId}/models`, {
+    modelName: model.modelName,
+    displayName: model.displayName,
+    inputCostPer1k: model.inputCostPer1k,
+    outputCostPer1k: model.outputCostPer1k,
+    maxContextTokens: model.maxContextTokens
+  });
+  return res.data as ModelInfo;
+}
