@@ -1,27 +1,29 @@
+/**
+ * chatViewProvider.ts — VS Code WebviewView provider for the AI Firewall chat panel.
+ *
+ * Responsibilities:
+ *   - Renders the webview UI (HTML/CSS/JS bundle)
+ *   - Routes messages between the webview and the proxy API
+ *   - Orchestrates the agentic iterate loop (stream → tool calls → file ops → commands)
+ *   - Enforces command security via commandSecurity module
+ *
+ * Modular dependencies:
+ *   - commandSecurity   — blocks/runs LLM-suggested shell commands safely
+ *   - agentParser       — parses <create_file>, <edit_file>, <run_command> tags
+ *   - fileContextService — builds codebase context injected into user messages
+ *   - proxyClient        — all HTTP calls to the proxy
+ */
+
 import * as path from "path";
 import * as vscode from "vscode";
-import { exec } from "child_process";
-import { promisify } from "util";
-import { FileIndexer, isBinaryPath } from "../services/fileIndexer";
+import { FileIndexer } from "../services/fileIndexer";
 import * as proxyClient from "../services/proxyClient";
+import { executeCommandsSecure, detectProjectCommands } from "../services/commandSecurity";
+import { parseFileOperations, parseRunCommands } from "../services/agentParser";
+import { messagesWithFileContext, readMentionedFilesContext, buildAgentSystemMessage } from "../services/fileContextService";
 import { updateAfterRequest } from "../statusBar";
 
-const execAsync = promisify(exec);
-
 const LOG_CHANNEL_NAME = "AI Firewall";
-
-// ── Security: commands that must never execute unattended ─────────────────
-const DESTRUCTIVE_COMMANDS = new Set([
-  "rm", "rmdir", "del", "rd", "format", "dd", "mkfs", "shred",
-  "fdisk", "parted", "wipefs", "truncate", "> /dev/", "chmod 777",
-  ":(){ :|:& };:", "fork bomb"
-]);
-
-// Patterns indicating LLM wants to pipe remote scripts (supply-chain attack)
-const REMOTE_PIPE_PATTERN = /\b(curl|wget|fetch)\b.*\|\s*(bash|sh|zsh|fish|python|node)/i;
-
-// Long-running processes that should run in a visible VS Code terminal, not silent exec
-const LONG_RUNNING_PATTERN = /^(npm\s+(start|run\s+dev|run\s+serve)|yarn\s+(start|dev|serve)|pnpm\s+(start|dev)|python\s+\S+\.py|node\s+\S+|ts-node\s+\S+|flask\s+run|uvicorn|fastapi|rails\s+s|rails\s+server|php\s+-S|go\s+run|cargo\s+run|dotnet\s+run)\b/i;
 
 export class ChatViewProvider implements vscode.WebviewViewProvider {
   public static readonly viewType = "aiFirewall.chatView";
@@ -242,11 +244,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           : workspaceFiles;
         const projectRoot = this._getCurrentRepoRoot();
         const messagesWithContext = await this._messagesWithFileContext(messages, filePaths, projectRoot ?? undefined, this._fileScopeCache);
+
+        const openAiTools = await this._getMcpOpenAiTools();
+
         this._log.appendLine(`  → Payload: model=${model}, messages=${messagesWithContext.length}, filePaths=${filePaths.length}, bypassed=${bypassedFilePaths.length}, repoRoot=${projectRoot ?? "(none)"}, contextInjected=${messagesWithContext !== messages}`);
         this._logPayload("  → Request body (to /api/estimate)", { model, messages: messagesWithContext.length, metadata: { filePaths, projectRoot, bypassedFilePaths } });
 
         try {
-          const result = await proxyClient.estimate(model, messagesWithContext, filePaths.length ? filePaths : undefined, projectRoot, bypassedFilePaths.length ? bypassedFilePaths : undefined);
+          const result = await proxyClient.estimate(model, messagesWithContext, filePaths.length ? filePaths : undefined, projectRoot, bypassedFilePaths.length ? bypassedFilePaths : undefined, openAiTools);
           this._log.appendLine(`  ← Proxy response (estimate): OK`);
           this._logPayload("  ← Estimate result", result);
           this._postToWebview({ type: "estimateResult", data: result });
@@ -281,42 +286,42 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           this._postToWebview({ type: "agentPhase", phase: "reading", label: `Reading ${filePaths.length} file${filePaths.length > 1 ? "s" : ""}…` });
         }
 
-        // ── Fetch MCP tools (if any servers are online) ─────────────────────
-        let mcpTools: proxyClient.McpTool[] = [];
-        try {
-          mcpTools = await proxyClient.listMcpTools();
-          if (mcpTools.length > 0) {
-            this._log.appendLine(`  → MCP tools: ${mcpTools.map((t) => `${t.server}:${t.name}`).join(", ")}`);
-            this._postToWebview({ type: "mcpTools", tools: mcpTools });
-          }
-        } catch { /* No MCP servers — proceed without tools */ }
+        const openAiTools = await this._getMcpOpenAiTools();
 
-        // Convert to OpenAI function-calling format (provider-agnostic — proxy normalises per provider)
-        const openAiTools = mcpTools.length > 0
-          ? mcpTools.map((t) => ({
-              type: "function" as const,
-              function: {
-                name: `${t.server}__${t.name}`,
-                description: `[${t.server}] ${t.description}`,
-                parameters: t.inputSchema
-              }
-            }))
-          : undefined;
+        // ── Detect project's test/build commands once ───────────────────────
+        const projectCmds = await detectProjectCommands(projectRoot);
+        this._log.appendLine(`[Agent] Detected: test="${projectCmds.test}" typecheck="${projectCmds.typecheck ?? "none"}" pm="${projectCmds.packageManager}"`);
 
-        // ── Agent iterate loop (max 5 rounds, like Cursor) ─────────────────
-        const MAX_ITER = 5;
-        let iterMessages = await this._messagesWithFileContext(baseMessages, filePaths, projectRoot ?? undefined, this._fileScopeCache);
+        // ── Inject system message so LLM always sees agent rules first ──────
+        const workspaceName = projectRoot ? path.basename(projectRoot) : "workspace";
+        const systemContent = buildAgentSystemMessage(projectCmds.test, workspaceName);
+        let iterMessages = await this._messagesWithFileContext(
+          baseMessages, filePaths, projectRoot ?? undefined, this._fileScopeCache
+        );
+        // Prepend system message (or replace the first system message if one exists)
+        if (iterMessages[0]?.role === "system") {
+          iterMessages[0] = { role: "system", content: systemContent + "\n\n" + iterMessages[0].content };
+        } else {
+          iterMessages = [{ role: "system", content: systemContent }, ...iterMessages];
+        }
+
         let firewallMeta: proxyClient.FirewallMeta | undefined;
+
+        // ── Autonomous agent iterate loop (up to 10 rounds) ─────────────────
+        // Rounds continue automatically when:
+        //   • File ops were written → always run build/test next
+        //   • Commands failed       → LLM must fix and retry
+        //   • LLM emits <continue>  → more work needed
+        const MAX_ITER = 10;
 
         for (let iter = 0; iter < MAX_ITER; iter++) {
           if (iter > 0) {
-            this._postToWebview({ type: "agentPhase", phase: "thinking", label: `Iterating (${iter + 1}/${MAX_ITER})…` });
+            this._postToWebview({ type: "agentPhase", phase: "thinking", label: `Round ${iter + 1}/${MAX_ITER}…` });
           }
-          this._postToWebview({ type: "agentPhase", phase: "writing", label: iter === 0 ? "Generating…" : "Revising…" });
+          this._postToWebview({ type: "agentPhase", phase: "writing", label: iter === 0 ? "Generating…" : "Fixing…" });
 
-          // ── Streaming response ──────────────────────────────────────────
+          // ── Stream one LLM response ─────────────────────────────────────
           let fullText = "";
-          // Accumulate tool_calls from stream deltas (OpenAI streaming format)
           let pendingToolCalls: proxyClient.ToolCallResult[] = [];
 
           const streamResult = await new Promise<{ ok: boolean; error?: string }>((resolve) => {
@@ -330,9 +335,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                   fullText += text;
                   this._postToWebview({ type: "chatChunk", text });
                 },
-                onToolCalls: (calls) => {
-                  pendingToolCalls = calls;
-                },
+                onToolCalls: (calls) => { pendingToolCalls = calls; },
                 onDone: (meta) => {
                   firewallMeta = meta;
                   this._postToWebview({ type: "chatStreamDone" });
@@ -358,35 +361,28 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             break;
           }
 
-          // ── Execute MCP tool calls (if LLM requested any) ───────────────
+          // ── MCP tool calls ──────────────────────────────────────────────
           if (pendingToolCalls.length > 0) {
-            this._postToWebview({ type: "agentPhase", phase: "running", label: `Calling ${pendingToolCalls.length} tool${pendingToolCalls.length > 1 ? "s" : ""}…` });
+            this._postToWebview({ type: "agentPhase", phase: "running", label: `Calling ${pendingToolCalls.length} MCP tool${pendingToolCalls.length > 1 ? "s" : ""}…` });
 
-            // Build assistant message with tool_calls so the next turn is valid
             const assistantWithTools: proxyClient.ChatMessage & Record<string, unknown> = {
               role: "assistant",
               content: fullText || null as unknown as string,
               tool_calls: pendingToolCalls.map((tc) => ({
-                id: tc.id,
-                type: "function",
+                id: tc.id, type: "function",
                 function: { name: tc.name, arguments: tc.argsJson }
               }))
             };
 
             const toolResultMessages: (proxyClient.ChatMessage & Record<string, unknown>)[] = [];
-
             for (const tc of pendingToolCalls) {
-              // "server__toolName" → ["server", "toolName"]
               const sep = tc.name.indexOf("__");
               const serverName = sep >= 0 ? tc.name.slice(0, sep) : tc.name;
               const toolName   = sep >= 0 ? tc.name.slice(sep + 2) : tc.name;
-
               let args: Record<string, unknown> = {};
-              try { args = JSON.parse(tc.argsJson || "{}") as Record<string, unknown>; } catch { /* bad JSON */ }
+              try { args = JSON.parse(tc.argsJson || "{}") as Record<string, unknown>; } catch { /* */ }
 
-              this._log.appendLine(`  → MCP tool call: ${serverName}/${toolName} args=${tc.argsJson.slice(0, 200)}`);
-              this._postToWebview({ type: "commandOutput", command: `[MCP] ${serverName}/${toolName}`, output: `Calling…`, exitCode: 0 });
-
+              this._postToWebview({ type: "commandOutput", command: `[MCP] ${serverName}/${toolName}`, output: "Calling…", exitCode: 0 });
               let resultText = "";
               let isError = false;
               try {
@@ -397,41 +393,49 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                 isError = true;
                 resultText = err instanceof Error ? err.message : "Tool call failed";
               }
-
-              this._log.appendLine(`  ← MCP tool result (${tc.name}): ${isError ? "ERROR" : "OK"} — ${resultText.slice(0, 200)}`);
               this._postToWebview({ type: "commandOutput", command: `[MCP] ${serverName}/${toolName}`, output: resultText || "(no output)", exitCode: isError ? 1 : 0 });
-
-              toolResultMessages.push({
-                role: "tool",
-                content: resultText,
-                tool_call_id: tc.id
-              });
+              toolResultMessages.push({ role: "tool", content: resultText, tool_call_id: tc.id });
             }
 
-            // Splice tool call + results into messages and continue the loop
             iterMessages = [...iterMessages, assistantWithTools, ...toolResultMessages];
-            // Don't emit chatResponse yet — the loop continues to get the final answer
-            continue;
+            continue; // loop back to get the LLM's follow-up after tool results
           }
 
-          // ── Apply file operations (with security check) ─────────────────
+          // ── Write files from <create_file> / <edit_file> tags ───────────
           const fileOps = this._parseFileOperations(fullText);
+          let commandOutputs: Array<{ command: string; output: string; exitCode: number }> = [];
+
           if (fileOps.length > 0) {
-            this._postToWebview({ type: "agentPhase", phase: "applying", label: `Applying ${fileOps.length} change${fileOps.length > 1 ? "s" : ""}…` });
+            this._postToWebview({ type: "agentPhase", phase: "applying", label: `Writing ${fileOps.length} file${fileOps.length > 1 ? "s" : ""}…` });
+            // Notify webview (shows diff cards)
             this._postToWebview({ type: "fileOperations", operations: fileOps });
-            // Auto-apply ops that pass security check
+            // Apply every op atomically
             for (const op of fileOps) {
               await this._applyFileOpSecure(op, projectRoot);
             }
           }
 
-          // ── Execute commands (with security check) ──────────────────────
-          const commands = this._parseRunCommands(fullText);
-          let commandOutputs: Array<{ command: string; output: string; exitCode: number }> = [];
+          // ── Execute <run_command> tags from LLM ─────────────────────────
+          const llmCommands = this._parseRunCommands(fullText);
+          if (llmCommands.length > 0) {
+            this._postToWebview({ type: "agentPhase", phase: "running", label: `Running ${llmCommands.length} command${llmCommands.length > 1 ? "s" : ""}…` });
+            const llmResults = await this._executeCommandsSecure(llmCommands, projectRoot ?? undefined);
+            commandOutputs.push(...llmResults);
+          }
 
-          if (commands.length > 0) {
-            this._postToWebview({ type: "agentPhase", phase: "running", label: `Running ${commands.length} command${commands.length > 1 ? "s" : ""}…` });
-            commandOutputs = await this._executeCommandsSecure(commands, projectRoot ?? undefined);
+          // ── Auto-run typecheck + tests after writing files ───────────────
+          // If the LLM wrote files but didn't include run_command tags itself,
+          // we run them automatically so failures get fed back for self-correction.
+          if (fileOps.length > 0 && llmCommands.length === 0) {
+            const autoCommands: string[] = [];
+            if (projectCmds.typecheck) autoCommands.push(projectCmds.typecheck);
+            autoCommands.push(projectCmds.test);
+
+            this._postToWebview({ type: "agentPhase", phase: "running", label: "Running tests…" });
+            for (const cmd of autoCommands) {
+              const results = await this._executeCommandsSecure([cmd], projectRoot ?? undefined);
+              commandOutputs.push(...results);
+            }
           }
 
           // ── Update status bar ───────────────────────────────────────────
@@ -445,28 +449,33 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           }
 
           // ── Decide whether to iterate ────────────────────────────────────
-          // Only iterate if: there were commands, any failed, and we have budget
           const failedCommands = commandOutputs.filter((c) => c.exitCode !== 0);
           const wantsContinue = /<continue>/i.test(fullText);
-          const shouldIterate = iter < MAX_ITER - 1 && (failedCommands.length > 0 || wantsContinue);
+          const hasMoreWork = failedCommands.length > 0 || wantsContinue;
 
-          if (shouldIterate) {
-            // Feed command outputs back to the LLM as context
+          if (hasMoreWork && iter < MAX_ITER - 1) {
+            // Build a feedback message with ALL command outputs for the LLM
             const outputSummary = commandOutputs
-              .map((c) => `$ ${c.command}\n${c.output}`)
-              .join("\n\n");
+              .map((c) => `$ ${c.command}\nexit ${c.exitCode}\n${c.output}`)
+              .join("\n\n---\n\n");
+
+            const feedbackContent = failedCommands.length > 0
+              ? `${failedCommands.length} command(s) failed. Fix the issues and re-run the tests:\n\n${outputSummary}\n\nDo NOT ask for permission. Fix the code, rewrite the files, and run the tests again.`
+              : `Commands completed. Continue:\n\n${outputSummary}`;
+
             iterMessages = [
               ...iterMessages,
               { role: "assistant", content: fullText },
-              {
-                role: "user",
-                content: failedCommands.length > 0
-                  ? `The following commands failed. Please fix the code and try again:\n\n${outputSummary}`
-                  : `Command outputs:\n\n${outputSummary}\n\nPlease continue.`
-              }
+              { role: "user", content: feedbackContent }
             ];
+            this._log.appendLine(`[Agent] Round ${iter + 1}: ${failedCommands.length} failures — iterating`);
           } else {
-            // Done — emit the final firewall response for metadata display
+            // Done — all tests pass (or no more iterations available)
+            if (failedCommands.length > 0) {
+              this._log.appendLine(`[Agent] Reached max iterations with ${failedCommands.length} remaining failures`);
+            } else {
+              this._log.appendLine(`[Agent] All checks passed after ${iter + 1} round(s)`);
+            }
             this._postToWebview({
               type: "chatResponse",
               data: {
@@ -801,167 +810,59 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  /** Read @mentioned files and format them as structured XML context */
+  private async _getMcpOpenAiTools(): Promise<proxyClient.OpenAiTool[] | undefined> {
+    let mcpTools: proxyClient.McpTool[] = [];
+    try {
+      mcpTools = await proxyClient.listMcpTools();
+      if (mcpTools.length > 0) {
+        this._log.appendLine(`  → MCP tools: ${mcpTools.map((t) => `${t.server}:${t.name}`).join(", ")}`);
+        this._postToWebview({ type: "mcpTools", tools: mcpTools });
+      }
+    } catch {
+      return undefined;
+    }
+
+    if (mcpTools.length === 0) return undefined;
+
+    return mcpTools.map((t) => ({
+      type: "function" as const,
+      function: {
+        name: `${t.server}__${t.name}`,
+        description: `[${t.server}] ${t.description}`,
+        parameters: t.inputSchema
+      }
+    }));
+  }
+
+  /** Read @mentioned files and format them as XML context — delegates to fileContextService */
   private async _readMentionedFilesContext(paths: string[], projectRoot: string): Promise<string> {
-    const MAX_FILE_CHARS = 50 * 1024; // 50 KB per file
-    const MAX_TOTAL_CHARS = 100_000;
-    const extToLang: Record<string, string> = {
-      ".ts": "typescript", ".tsx": "typescript", ".js": "javascript", ".jsx": "javascript",
-      ".json": "json", ".html": "html", ".css": "css", ".md": "markdown", ".py": "python",
-      ".go": "go", ".rs": "rust", ".java": "java", ".rb": "ruby", ".sh": "shell",
-      ".c": "c", ".cpp": "cpp", ".h": "c", ".cs": "csharp", ".php": "php",
-      ".swift": "swift", ".kt": "kotlin", ".yaml": "yaml", ".yml": "yaml", ".toml": "toml"
-    };
-
-    const parts: string[] = [];
-    let totalChars = 0;
-
-    for (const rel of paths) {
-      if (totalChars >= MAX_TOTAL_CHARS) break;
-
-      const abs = path.isAbsolute(rel) ? rel : path.join(projectRoot, rel);
-
-      // Reject binary files
-      if (isBinaryPath(rel)) {
-        parts.push(`<!-- ${rel}: binary file skipped -->`);
-        continue;
-      }
-
-      try {
-        const uri = vscode.Uri.file(abs);
-        const stat = await vscode.workspace.fs.stat(uri);
-
-        // Warn about very large files (> 500 KB)
-        if (stat.size > 500 * 1024) {
-          parts.push(`<!-- ${rel}: file too large (${Math.round(stat.size / 1024)} KB), skipped. Use specific line ranges instead. -->`);
-          continue;
-        }
-
-        const doc = await vscode.workspace.openTextDocument(uri);
-        let text = doc.getText();
-
-        if (text.length > MAX_FILE_CHARS) {
-          text = text.slice(0, MAX_FILE_CHARS) + "\n\n... (truncated — file too large)";
-        }
-        if (totalChars + text.length > MAX_TOTAL_CHARS) {
-          text = text.slice(0, MAX_TOTAL_CHARS - totalChars) + "\n\n... (truncated — total context limit reached)";
-        }
-
-        totalChars += text.length;
-        const ext = path.extname(rel).toLowerCase();
-        const lang = extToLang[ext] ?? "text";
-        parts.push(`<file path="${rel}" language="${lang}">\n${text}\n</file>`);
-      } catch {
-        parts.push(`<!-- ${rel}: could not be read -->`);
-      }
-    }
-
-    return parts.join("\n\n");
+    return readMentionedFilesContext(paths, projectRoot);
   }
 
-  /** Parse <run_command> tags from LLM response */
+  /** Parse {@code <run_command>} tags from LLM response — delegates to agentParser */
   private _parseRunCommands(content: string): string[] {
-    const commands: string[] = [];
-    const regex = /<run_command>([\s\S]*?)<\/run_command>/g;
-    let m: RegExpExecArray | null;
-    while ((m = regex.exec(content)) !== null) {
-      const cmd = m[1].trim();
-      if (cmd) commands.push(cmd);
-    }
-    return commands;
+    return parseRunCommands(content);
   }
 
   /**
-   * Checks whether a command contains destructive or dangerous patterns.
-   * Returns a reason string if blocked, undefined if safe.
-   */
-  private _isDestructiveCommand(cmd: string): string | undefined {
-    const lower = cmd.toLowerCase().trim();
-
-    // Remote pipe: curl|wget piped to a shell interpreter
-    if (REMOTE_PIPE_PATTERN.test(cmd)) {
-      return `Remote pipe execution blocked: "${cmd.slice(0, 80)}"`;
-    }
-
-    // Check each space-delimited token for known destructive commands
-    const firstToken = lower.split(/\s+/)[0];
-    if (DESTRUCTIVE_COMMANDS.has(firstToken)) {
-      return `Destructive command blocked: "${firstToken}"`;
-    }
-
-    // rm -rf specifically (including variants like rm -r -f)
-    if (/\brm\b.*-[a-z]*r[a-z]*f/i.test(cmd) || /\brm\b.*-[a-z]*f[a-z]*r/i.test(cmd)) {
-      return `Destructive command blocked: rm -rf`;
-    }
-
-    // Path traversal in command args (potential escape from workspace)
-    if (/\.\.[/\\]/.test(cmd)) {
-      return `Path traversal in command blocked: "${cmd.slice(0, 80)}"`;
-    }
-
-    return undefined;
-  }
-
-  /**
-   * Execute shell commands securely and return results for the iterate loop.
-   * - Destructive commands are blocked and reported without executing.
-   * - Long-running processes (npm start, python app.py, etc.) are launched
-   *   in a visible VS Code Terminal so the user can see and control them.
-   * - One-shot commands (npm install, npm test, etc.) run via exec and
-   *   return their output to the chat.
+   * Execute shell commands securely — delegates to commandSecurity module.
+   * Destructive commands are blocked. Long-running servers use a VS Code terminal.
    */
   private async _executeCommandsSecure(
     commands: string[],
     cwd?: string
   ): Promise<Array<{ command: string; output: string; exitCode: number }>> {
-    const workdir = cwd ?? vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
-    const results: Array<{ command: string; output: string; exitCode: number }> = [];
-
-    for (const cmd of commands) {
-      // Security check
-      const blockReason = this._isDestructiveCommand(cmd);
-      if (blockReason) {
-        this._log.appendLine(`[Security] Blocked command: ${cmd}\n  Reason: ${blockReason}`);
-        const output = `[AI Firewall blocked this command]\n${blockReason}`;
-        this._postToWebview({ type: "commandOutput", command: cmd, output, exitCode: 1 });
-        results.push({ command: cmd, output, exitCode: 1 });
-        vscode.window.showWarningMessage(`AI Firewall blocked: ${blockReason}`);
-        continue;
+    const termRef = { current: this._agentTerminal };
+    const results = await executeCommandsSecure(
+      commands,
+      cwd,
+      termRef,
+      (result) => {
+        this._log.appendLine(`[Command] ${result.exitCode === 0 ? "OK" : "FAIL"}: ${result.command}`);
+        this._postToWebview({ type: "commandOutput", ...result });
       }
-
-      // Long-running process → VS Code terminal (visible + user-controlled)
-      if (LONG_RUNNING_PATTERN.test(cmd.trim())) {
-        if (!this._agentTerminal || this._agentTerminal.exitStatus !== undefined) {
-          this._agentTerminal = vscode.window.createTerminal({
-            name: "AI Firewall Agent",
-            cwd: workdir
-          });
-        }
-        this._agentTerminal.show(true);
-        this._agentTerminal.sendText(cmd);
-        const output = `[Running in terminal: ${cmd}]`;
-        this._postToWebview({ type: "commandOutput", command: cmd, output, exitCode: 0 });
-        results.push({ command: cmd, output, exitCode: 0 });
-        continue;
-      }
-
-      // One-shot command → exec + capture output
-      try {
-        const { stdout, stderr } = await execAsync(cmd, {
-          cwd: workdir,
-          timeout: 60_000
-        });
-        const output = (stdout + (stderr ? `\n[stderr]\n${stderr}` : "")).trim();
-        this._postToWebview({ type: "commandOutput", command: cmd, output, exitCode: 0 });
-        results.push({ command: cmd, output, exitCode: 0 });
-      } catch (err) {
-        const e = err as { stderr?: string; stdout?: string; message?: string; code?: number };
-        const output = ((e.stdout ?? "") + "\n" + (e.stderr ?? e.message ?? "")).trim();
-        this._postToWebview({ type: "commandOutput", command: cmd, output, exitCode: e.code ?? 1 });
-        results.push({ command: cmd, output, exitCode: e.code ?? 1 });
-      }
-    }
-
+    );
+    this._agentTerminal = termRef.current;
     return results;
   }
 
@@ -977,13 +878,24 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   ): Promise<void> {
     if (!projectRoot) return;
 
-    const rel = op.path.replace(/\\/g, "/").replace(/^\/+/, "");
-
-    // 1. Block absolute paths and traversal outside workspace
-    if (path.isAbsolute(op.path) || rel.includes("../") || rel.startsWith("..")) {
-      this._postToWebview({ type: "toast", message: `Security: blocked write to "${op.path}" (path traversal)` });
-      vscode.window.showWarningMessage(`AI Firewall: blocked file write outside workspace: ${op.path}`);
-      return;
+    const rel = path.isAbsolute(op.path) ? op.path.replace(projectRoot, "").replace(/\\/g, "/").replace(/^\/+/, "") : op.path.replace(/\\/g, "/").replace(/^\/+/, "");
+    let abs: string;
+    if (path.isAbsolute(op.path)) {
+      if (!op.path.startsWith(projectRoot)) {
+        this._log.appendLine(`[Security] Blocked absolute path outside workspace: ${op.path}`);
+        this._postToWebview({ type: "toast", message: `Security: blocked write outside workspace: "${op.path}"` });
+        vscode.window.showWarningMessage(`AI Firewall: blocked file write outside workspace: ${op.path}`);
+        return;
+      }
+      abs = op.path;
+    } else {
+      if (rel.includes("../") || rel.startsWith("..")) {
+        this._log.appendLine(`[Security] Blocked traversal path: ${op.path}`);
+        this._postToWebview({ type: "toast", message: `Security: blocked path traversal: "${op.path}"` });
+        vscode.window.showWarningMessage(`AI Firewall: blocked path traversal: ${op.path}`);
+        return;
+      }
+      abs = path.join(projectRoot, rel);
     }
 
     // 2. File scope blocklist check
@@ -994,7 +906,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       return;
     }
 
-    const abs = path.join(projectRoot, rel);
     const uri = vscode.Uri.file(abs);
 
     try {
@@ -1018,31 +929,26 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         this._postToWebview({ type: "toast", message: `⚠ Secret pattern found in generated "${rel}" — please review` });
       }
 
-      // Open file so user sees the change
+      // Notify webview and open the file beside the chat panel (not replacing it)
+      this._postToWebview({ type: "fileWritten", path: rel, opType: op.type });
       try {
         const doc = await vscode.workspace.openTextDocument(uri);
-        await vscode.window.showTextDocument(doc, { preview: true });
-      } catch { /* ignore */ }
+        // ViewColumn.Beside: opens next to the active editor without stealing focus
+        await vscode.window.showTextDocument(doc, {
+          preview: false,
+          preserveFocus: true,
+          viewColumn: vscode.ViewColumn.Beside
+        });
+      } catch { /* ignore open failures — file was written successfully */ }
     } catch (err) {
       const message = err instanceof Error ? err.message : "Failed to apply";
       this._postToWebview({ type: "toast", message: `Error writing "${rel}": ${message}` });
     }
   }
 
-  /** Parse LLM response content for agentic XML file operation tags */
+  /** Parse {@code <create_file>} and {@code <edit_file>} tags — delegates to agentParser */
   private _parseFileOperations(content: string): Array<{ type: "create" | "edit"; path: string; content: string }> {
-    const ops: Array<{ type: "create" | "edit"; path: string; content: string }> = [];
-    const createRegex = /<create_file\s+path="([^"]+)">([\s\S]*?)<\/create_file>/g;
-    const editRegex = /<edit_file\s+path="([^"]+)">([\s\S]*?)<\/edit_file>/g;
-
-    let m: RegExpExecArray | null;
-    while ((m = createRegex.exec(content)) !== null) {
-      ops.push({ type: "create", path: m[1].trim(), content: m[2] });
-    }
-    while ((m = editRegex.exec(content)) !== null) {
-      ops.push({ type: "edit", path: m[1].trim(), content: m[2] });
-    }
-    return ops;
+    return parseFileOperations(content);
   }
 
   private async _sendInitialData(): Promise<void> {
@@ -1097,92 +1003,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     return folders[0].uri.fsPath;
   }
 
-  /** Read file contents from the current repository and format as code context (Copilot/Cursor-style). */
-  private async _readWorkspaceFileContext(
-    filePaths: string[],
-    projectRoot: string,
-    maxFileSizeKb: number = 50,
-    maxTotalChars: number = 80_000,
-    maxFiles: number = 25
-  ): Promise<string> {
-    if (filePaths.length === 0) return "";
-    const maxCharsPerFile = maxFileSizeKb * 1024;
-    let totalChars = 0;
-    const parts: string[] = [];
-    const extToLang: Record<string, string> = {
-      ".ts": "typescript", ".tsx": "typescript", ".js": "javascript", ".jsx": "javascript",
-      ".json": "json", ".html": "html", ".css": "css", ".md": "markdown", ".py": "python",
-      ".go": "go", ".rs": "rust", ".java": "java", ".rb": "ruby", ".sh": "shell"
-    };
-    for (let i = 0; i < filePaths.length && i < maxFiles && totalChars < maxTotalChars; i++) {
-      const rel = filePaths[i];
-      const absolutePath = path.isAbsolute(rel) ? rel : path.join(projectRoot, rel);
-      const uri = vscode.Uri.file(absolutePath);
-      try {
-        const doc = await vscode.workspace.openTextDocument(uri);
-        let text = doc.getText();
-        if (text.length > maxCharsPerFile) text = text.slice(0, maxCharsPerFile) + "\n\n... (truncated)";
-        if (totalChars + text.length > maxTotalChars) {
-          text = text.slice(0, maxTotalChars - totalChars) + "\n\n... (truncated)";
-        }
-        totalChars += text.length;
-        const ext = path.extname(rel);
-        const lang = extToLang[ext] ?? "";
-        const fence = lang ? lang : "text";
-        parts.push(`## ${rel}\n\`\`\`${fence}\n${text}\n\`\`\``);
-      } catch {
-        // Skip binary or unreadable files
-      }
-    }
-    if (parts.length === 0) return "";
-    return "\n\n--- Code context (current repository) ---\n\n" + parts.join("\n\n");
-  }
-
-  /** Files to exclude from context injection: lockfiles and similar contain hashes that trigger false-positive secret detection. */
-  private static readonly CONTEXT_EXCLUDE_PATTERNS = [
-    "package-lock.json",
-    "yarn.lock",
-    "pnpm-lock.yaml",
-    "bun.lockb",
-    ".min.js",
-    ".bundle.js"
-  ];
-
-  private _isExcludedFromContext(relPath: string): boolean {
-    const normalised = relPath.replace(/\\/g, "/");
-    const base = path.basename(normalised);
-    if (ChatViewProvider.CONTEXT_EXCLUDE_PATTERNS.some((p) => base === p || base.endsWith(p))) return true;
-    if (normalised.includes("node_modules") || normalised.includes("dist/") || normalised.includes(".git/")) return true;
-    return false;
-  }
-
-  /** Inject file context into the last user message so the model sees the code (like Copilot/Cursor). */
+  /** Inject file context into the last user message — delegates to fileContextService */
   private async _messagesWithFileContext(
     messages: proxyClient.ChatMessage[],
     filePaths: string[],
     projectRoot: string | undefined,
     fileScope: proxyClient.FileScopeConfig | null
   ): Promise<proxyClient.ChatMessage[]> {
-    if (filePaths.length === 0 || !projectRoot) return messages;
-    const scope = fileScope ?? undefined;
-    const safeForContext = filePaths.filter(
-      (p) => !this._isExcludedFromContext(p) && (!scope || !this._isRestricted(p, scope))
-    );
-    if (safeForContext.length === 0) return messages;
-    const maxKb = fileScope?.max_file_size_kb ?? 500;
-    const context = await this._readWorkspaceFileContext(safeForContext, projectRoot, Math.min(maxKb, 50), 80_000, 25);
-    if (!context) return messages;
-    const out = [...messages];
-    const lastUserIndex = out.map((m, i) => ({ i, role: m.role })).filter((x) => x.role === "user").pop()?.i ?? -1;
-    if (lastUserIndex >= 0 && out[lastUserIndex].content) {
-      out[lastUserIndex] = {
-        ...out[lastUserIndex],
-        content: out[lastUserIndex].content + context
-      };
-    } else {
-      out.push({ role: "user", content: "Context from the current repository:" + context });
-    }
-    return out;
+    return messagesWithFileContext(messages, filePaths, projectRoot, fileScope, this._log);
   }
 
   private _toRelativePath(fsPath: string): string {
@@ -1195,39 +1023,40 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
   private _isRestricted(relPath: string, scope: proxyClient.FileScopeConfig): boolean {
     const blocklist = scope.blocklist ?? [];
-    return blocklist.some((pattern) => {
-      // Simple glob matching: exact match, prefix match for ** patterns, or suffix match
-      if (pattern === relPath) return true;
-      // Handle **/* style patterns
-      if (pattern.startsWith("**/")) {
+    for (const pattern of blocklist) {
+      let blocked = false;
+      // Simple glob matching
+      if (pattern === relPath) blocked = true;
+      else if (pattern.startsWith("**/")) {
         const suffix = pattern.slice(3);
-        if (relPath.endsWith(suffix) || relPath.includes("/" + suffix)) return true;
-        // Handle **/dir/** patterns
+        if (relPath.endsWith(suffix) || relPath.includes("/" + suffix)) blocked = true;
         const inner = pattern.replace(/\*\*/g, "").replace(/\//g, "");
-        if (inner && relPath.includes(inner)) return true;
+        if (inner && relPath.includes(inner)) blocked = true;
       }
-      // Handle dir/** patterns
-      if (pattern.endsWith("/**")) {
+      else if (pattern.endsWith("/**")) {
         const prefix = pattern.slice(0, -3);
-        if (relPath.startsWith(prefix + "/") || relPath === prefix) return true;
+        if (relPath.startsWith(prefix + "/") || relPath === prefix) blocked = true;
       }
-      // Handle *.ext patterns
-      if (pattern.startsWith("*.")) {
+      else if (pattern.startsWith("*.")) {
         const ext = pattern.slice(1);
-        if (relPath.endsWith(ext)) return true;
+        if (relPath.endsWith(ext)) blocked = true;
       }
-      // Handle .env.* style patterns
-      if (pattern.includes("*")) {
+      else if (pattern.includes("*")) {
         const [before, after] = pattern.split("*");
         const base = relPath.split("/").pop() ?? relPath;
         if (before && after) {
-          if (base.startsWith(before) && base.endsWith(after)) return true;
+          if (base.startsWith(before) && base.endsWith(after)) blocked = true;
         } else if (before) {
-          if (base.startsWith(before)) return true;
+          if (base.startsWith(before)) blocked = true;
         }
       }
-      return false;
-    });
+
+      if (blocked) {
+        this._log.appendLine(`[Security] Blocked access to "${relPath}" (matched pattern: "${pattern}")`);
+        return true;
+      }
+    }
+    return false;
   }
 
   private async _getWorkspaceFilePaths(): Promise<string[]> {
@@ -1252,14 +1081,27 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
 
     const scope = this._fileScopeCache!;
-    const blocklist = scope.blocklist ?? [];
-    const excludeGlobs = blocklist.filter(Boolean);
-    const exclude = excludeGlobs.length ? `{${excludeGlobs.join(",")}}` : undefined;
+    const blocklist = (scope.blocklist ?? []).filter(Boolean);
+    // Simplify exclude for findFiles: just use standard blocks most likely to bloat results
+    const heavyBlocks = ["**/node_modules/**", "**/dist/**", "**/.git/**"];
+    const exclude = `{${heavyBlocks.join(",")}}`;
 
-    // Read current repository in the IDE (only the active workspace folder)
+    this._log.appendLine(`[Repository] Reading files in ${root} (exclude: ${exclude})`);
     const rootUri = vscode.Uri.file(root);
     const includePattern = new vscode.RelativePattern(rootUri, "**/*");
     const uris = await vscode.workspace.findFiles(includePattern, exclude, 5000);
+    this._log.appendLine(`[Repository] findFiles returned ${uris.length} files`);
+    
+    if (uris.length === 0) {
+      this._log.appendLine(`[Repository] WARNING: zero files found. checking if root exists.`);
+      try {
+        await vscode.workspace.fs.stat(rootUri);
+        this._log.appendLine(`[Repository] Root exists.`);
+      } catch (e) {
+        this._log.appendLine(`[Repository] ERROR: Root does not exist or not accessible: ${e}`);
+      }
+    }
+
     const rel = (p: string) => {
       if (p.startsWith(root)) {
         const r = p.slice(root.length).replace(/^\/+/, "");
@@ -1440,11 +1282,23 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     .icon-btn svg { width: 15px; height: 15px; }
     .icon-btn input[type=checkbox] { display: none; }
 
-    /* Send button — round, accent colour */
-    .send-icon-btn { width: 30px; height: 30px; border-radius: 50%; border: none; background: var(--btn-bg); color: var(--btn-fg); cursor: pointer; display: flex; align-items: center; justify-content: center; flex-shrink: 0; transition: background .12s, opacity .12s; }
-    .send-icon-btn:hover:not(:disabled) { background: var(--btn-hover); }
-    .send-icon-btn:disabled { opacity: .35; cursor: not-allowed; }
-    .send-icon-btn svg { width: 15px; height: 15px; }
+    /* Send button — round accent pill with paper-airplane icon */
+    .send-icon-btn {
+      width: 32px; height: 32px; border-radius: 50%; border: none;
+      background: var(--btn-bg); color: var(--btn-fg);
+      cursor: pointer; display: flex; align-items: center; justify-content: center;
+      flex-shrink: 0; transition: background .15s, transform .1s, box-shadow .15s;
+      box-shadow: 0 1px 4px rgba(0,0,0,.18);
+    }
+    .send-icon-btn:hover:not(:disabled) {
+      background: var(--btn-hover);
+      transform: scale(1.07);
+      box-shadow: 0 2px 8px rgba(0,0,0,.22);
+    }
+    .send-icon-btn:active:not(:disabled) { transform: scale(.95); }
+    .send-icon-btn:disabled { opacity: .32; cursor: not-allowed; box-shadow: none; }
+    /* nudge the paper-airplane slightly to centre it visually */
+    .send-icon-btn svg { width: 15px; height: 15px; transform: translateX(1px) translateY(-1px); }
 
     /* ── Provider tiles ──────────────────────────────────────── */
     .provider-tiles { display: grid; grid-template-columns: repeat(auto-fill, minmax(80px, 1fr)); gap: 8px; margin-bottom: 10px; }
@@ -1492,9 +1346,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     .composer-input-row { display: flex; align-items: flex-end; }
     .composer-footer-spacer { flex: 1; }
 
-    /* Attach button badge */
-    .attach-btn { position: relative; }
-    .attach-badge { position: absolute; top: 0; right: 0; background: var(--btn-bg); color: var(--btn-fg); border-radius: 50%; font-size: 8px; width: 14px; height: 14px; display: flex; align-items: center; justify-content: center; font-weight: 700; }
+    /* Attach / pin button */
+    .attach-btn { position: relative; border-radius: 7px !important; }
+    .attach-btn svg { transition: transform .15s; }
+    .attach-btn:hover svg { transform: rotate(-20deg) scale(1.1); }
+    .attach-badge { position: absolute; top: -1px; right: -1px; background: var(--btn-bg); color: var(--btn-fg); border-radius: 50%; font-size: 8px; width: 14px; height: 14px; display: flex; align-items: center; justify-content: center; font-weight: 700; }
 
     /* File chips inside composer */
     .composer-file-chips { display: flex; flex-wrap: wrap; gap: 4px; padding: 4px 10px 0; }

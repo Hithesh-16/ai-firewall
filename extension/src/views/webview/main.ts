@@ -16,7 +16,7 @@ const vscode = acquireVsCodeApi();
 
 type ChatMsg = { role: string; content: string };
 type Provider = { id: number; name: string; slug: string; baseUrl: string; enabled: boolean };
-type Model = { id: number; providerId: number; modelName: string; displayName: string; inputCostPer1k: number; outputCostPer1k: number; maxContextTokens?: number; enabled: boolean; registered?: boolean };
+type Model = { id: number; providerId: number; modelName: string; displayName: string; inputCostPer1k: number; outputCostPer1k: number; maxContextTokens?: number; enabled: boolean; registered: boolean };
 type Credit = { id: number; providerId: number | null; limitType: string; totalLimit: number; usedAmount: number; resetPeriod: string; resetDate: number; hardLimit: boolean };
 type FileOp = { type: "create" | "edit"; path: string; content: string };
 type EstResult = {
@@ -183,10 +183,23 @@ function renderTab(id: string, label: string): string {
 
 // ── Chat ────────────────────────────────────────────────────────────────
 
-// SVG icons as constants
-const ICON_SEND = `<svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 1l7 7-7 7M15 8H1"/></svg>`;
-const ICON_SEND_FILLED = `<svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><circle cx="8" cy="8" r="8"/><path d="M8 4.5l3.5 3.5-3.5 3.5M11.5 8h-7" stroke="white" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" fill="none"/></svg>`;
-const ICON_ATTACH = `<svg width="15" height="15" viewBox="0 0 15 15" fill="currentColor" aria-hidden="true"><path d="M3.5 10.5v-6a4 4 0 0 1 8 0v7a2.5 2.5 0 0 1-5 0v-6a1 1 0 0 1 2 0v5.5"/></svg>`;
+// ── SVG icon constants ──────────────────────────────────────────────────────
+// Paper-airplane send icon (Bootstrap Icons "send-fill", 16×16 grid)
+const ICON_SEND_FILLED = `<svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
+  <path d="M15.964.686a.5.5 0 0 0-.65-.65L.767 5.855H.766l-.452.18a.5.5 0 0 0-.082.887l.41.26.001.002
+    4.995 3.178 3.178 4.995.002.002.26.41a.5.5 0 0 0 .886-.083l6-15Zm-1.833 1.89L6.637 10.07l-.215-.338
+    a.5.5 0 0 0-.154-.154l-.338-.215 7.494-7.494 1.178-.471-.47 1.178Z"/>
+</svg>`;
+// Kept for potential inline use elsewhere
+const ICON_SEND = ICON_SEND_FILLED;
+// Thumbtack / pin icon (Bootstrap Icons "pin-angle-fill", 16×16 grid)
+const ICON_ATTACH = `<svg width="15" height="15" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
+  <path d="M9.828.722a.5.5 0 0 1 .354.146l4.95 4.95a.5.5 0 0 1 0 .707c-.48.48-1.072.588-1.503.588
+    -.177 0-.335-.018-.46-.039l-3.134 3.134a5.927 5.927 0 0 1 .16 1.013c.046.702-.032 1.687-.72 2.375
+    a.5.5 0 0 1-.707 0l-2.829-2.828-3.182 3.182c-.195.195-1.219.902-1.414.707-.195-.195.512-1.22.707-1.414
+    l3.182-3.182-2.828-2.829a.5.5 0 0 1 0-.707c.688-.688 1.673-.767 2.375-.72a5.922 5.922 0 0 1 1.013.16
+    l3.134-3.133a2.772 2.772 0 0 1-.04-.461c0-.43.108-1.022.589-1.503a.5.5 0 0 1 .353-.146z"/>
+</svg>`;
 
 function renderChat(): string {
   const enabledModels = models.filter((m) => m.enabled && (m.registered !== false));
@@ -408,11 +421,12 @@ function renderPreFlight(est: EstResult): string {
       ${est.scan.piiFound > 0 ? `<div class="pf-row"><span class="pf-label">PII</span><span style="color:var(--warning)">${est.scan.piiFound} found</span></div>` : ""}
       ${est.scan.riskScore > 0 ? `<div class="pf-row"><span class="pf-label">Risk score</span><span>${est.scan.riskScore}/100</span></div>` : ""}
       ${(est.modelPolicyBlocked?.blockedFiles?.length ?? 0) > 0 ? `<div class="pf-row"><span class="pf-label">Files excluded</span><span style="color:var(--subtle);font-size:11px">${esc(est.modelPolicyBlocked!.blockedFiles.slice(0, 5).join(", "))}${est.modelPolicyBlocked!.blockedFiles.length > 5 ? "…" : ""} (by policy, request will use remaining files)</span></div>` : ""}
-      ${(est.scan.sensitiveFiles?.length ?? 0) > 0 ? `<div class="pf-row"><span class="pf-label">Files at risk</span><span style="color:var(--warning);font-size:11px">${esc(est.scan.sensitiveFiles.slice(0, 8).join(", "))}${(est.scan.sensitiveFiles?.length ?? 0) > 8 ? "…" : ""}</span></div>` : ""}
-      ${(est.scan.findingTypes?.length ?? 0) > 0 ? `<div class="pf-row"><span class="pf-label">Finding types</span><span style="font-size:11px">${esc(est.scan.findingTypes.join(", "))}</span></div>` : ""}
+      ${(est.scan.sensitiveFiles?.length ?? 0) > 0 ? `<div class="pf-row"><span class="pf-label">Files at risk</span><span style="color:var(--warning);font-size:11px">${esc(est.scan.sensitiveFiles!.slice(0, 8).join(", "))}${(est.scan.sensitiveFiles?.length ?? 0) > 8 ? "…" : ""}</span></div>` : ""}
+      ${(est.scan.findingTypes?.length ?? 0) > 0 ? `<div class="pf-row"><span class="pf-label">Finding types</span><span style="font-size:11px">${esc(est.scan.findingTypes!.join(", "))}</span></div>` : ""}
       ${est.scan.action === "BLOCK" ? `<div style="color:var(--error);margin-top:6px;font-size:11px">${esc(est.scan.reasons.join(". "))}</div>` : ""}
+      ${!est.model.registered ? `<div style="color:var(--error);margin-top:6px;font-size:11px">Cannot send: ${esc(est.model.provider)} missing valid API key</div>` : ""}
       <div class="pf-actions">
-        ${est.scan.action !== "BLOCK" ? `<button type="button" class="btn btn-primary btn-sm" id="pf-confirm">Send</button>` : ""}
+        ${est.scan.action !== "BLOCK" && est.model.registered ? `<button type="button" class="btn btn-primary btn-sm" id="pf-confirm">Send</button>` : ""}
         <button type="button" class="btn btn-secondary btn-sm" id="pf-cancel">Cancel</button>
       </div>
     </div>
@@ -1568,6 +1582,14 @@ window.addEventListener("message", (event) => {
       } else {
         render();
       }
+      break;
+    }
+
+    case "fileWritten": {
+      // Show a compact inline notification for each file the agent created/edited
+      const opLabel = (msg.opType as string) === "create" ? "Created" : "Updated";
+      chatHistory.push({ role: "system", content: `📄 ${opLabel}: \`${msg.path as string}\`` });
+      render();
       break;
     }
 

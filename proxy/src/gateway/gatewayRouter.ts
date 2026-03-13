@@ -16,7 +16,7 @@ function buildProviderUrl(provider: Provider, model: Model): string {
   const slug = provider.slug.toLowerCase();
 
   if (slug.includes("ollama") || slug === "local") {
-    return `${base}/api/chat`;
+    return `${base}/v1/chat/completions`;
   }
   if (slug.includes("anthropic") || slug.includes("claude")) {
     return `${base}/v1/messages`;
@@ -53,6 +53,8 @@ export function resolveGatewayRoute(requestedModel: string): GatewayRouteDecisio
   if (!isLocalProvider(provider)) {
     try {
       decryptedKey = decryptProviderKey(provider);
+      // If the key is a dummy placeholder, the provider is not truly registered
+      if (decryptedKey.startsWith("dummy-key-")) return null;
     } catch {
       return null;
     }
@@ -198,14 +200,18 @@ export function extractTokenUsage(
     };
   }
 
+  // Ollama handles OpenAI compatible usage as well if hit via /v1/chat/completions, 
+  // but just in case it's using the native API:
   if (slug.includes("ollama") || slug === "local") {
-    return {
-      inputTokens: (responseData.prompt_eval_count as number) ?? 0,
-      outputTokens: (responseData.eval_count as number) ?? 0,
-      totalTokens:
-        ((responseData.prompt_eval_count as number) ?? 0) +
-        ((responseData.eval_count as number) ?? 0)
-    };
+    if (responseData.prompt_eval_count !== undefined) {
+      return {
+        inputTokens: (responseData.prompt_eval_count as number) ?? 0,
+        outputTokens: (responseData.eval_count as number) ?? 0,
+        totalTokens:
+          ((responseData.prompt_eval_count as number) ?? 0) +
+          ((responseData.eval_count as number) ?? 0)
+      };
+    }
   }
 
   const usage = responseData.usage as {

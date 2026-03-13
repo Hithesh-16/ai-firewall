@@ -4,6 +4,7 @@ import { loadPolicyConfig } from "../config";
 import { checkCredit } from "../gateway/creditService";
 import { findModelByName } from "../gateway/modelService";
 import { getProviderById } from "../gateway/providerService";
+import { resolveGatewayRoute } from "../gateway/gatewayRouter";
 import { evaluatePolicy } from "../policy/policyEngine";
 import { mergeProjectPolicy } from "../policy/projectPolicy";
 import { scanPII } from "../scanner/piiScanner";
@@ -206,7 +207,7 @@ export async function registerEstimateRoute(app: FastifyInstance): Promise<void>
         name: registeredModel?.modelName ?? model,
         displayName: registeredModel?.displayName ?? model,
         provider: providerName,
-        registered: registeredModel !== null
+        registered: resolveGatewayRoute(model) !== null
       }
     };
   });

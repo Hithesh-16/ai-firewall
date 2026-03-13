@@ -159,10 +159,17 @@ Request received at /v1/chat/completions
     │
     ├── AI Gateway
     │   ├── Lookup provider + model
+    │   ├── Enforce Model Restrictions (No cloud creation, Global uniqueness)
     │   ├── Decrypt API key from vault
     │   ├── Check credit limits
     │   ├── Format request for provider (OpenAI/Anthropic/Gemini/Ollama)
     │   └── Forward request
+    │
+    ├── MCP Security Gateway Proxy
+    │   ├── Intercept MCP traffic (tools/call, resources/read)
+    │   ├── Scan tool arguments for secrets/PII
+    │   ├── Route to configured downstream Multi-Servers
+    │   └── Scan/Redact tool results before AI context ingest
     │
     ├── Log to SQLite (sanitized only, SHA-256 hash of original)
     ├── Record usage (tokens, cost)
@@ -582,7 +589,14 @@ Place in project root to override global policy:
 | OpenAI | `/v1/chat/completions` | ✅ |
 | Anthropic | `/v1/messages` | ✅ |
 | Google Gemini | `generateContent` | ✅ |
-| Ollama (Local) | `/api/chat` | ✅ |
+| Ollama (Local) | `/v1/chat/completions` | ✅ |
+| x.ai (Grok) | `/v1/chat/completions` | ✅ |
+| DeepSeek | `/v1/chat/completions` | ✅ |
+
+### Model Creation Restrictions
+- **Cloud Immutability**: The AI Firewall restricts manual model creation on cloud providers (e.g. OpenAI, Anthropic, Gemini, Grok) to prevent unauthorized overrides of the trusted models.
+- **Local Provider Extensibility**: Users can manually register new models exclusively on local providers (e.g., Ollama or providers with a `local` slug).
+- **Global Name Uniqueness**: To prevent request routing confusion, duplicate model names across any provider are strictly forbidden (returns 409 Conflict).
 
 ### Key Features
 
@@ -591,6 +605,20 @@ Place in project root to override global policy:
 - **Auto-Reset** — Credits reset on configurable schedule (daily/weekly/monthly)
 - **Usage Tracking** — Per-request token and cost recording with summary breakdowns
 - **Pre-flight Estimation** — `POST /api/estimate` returns scan result + estimated tokens + cost + credit remaining before sending
+
+---
+
+## 10. MCP Security Gateway Proxy
+
+The **Model Context Protocol (MCP)** integration enables the AI Firewall to intercept, scan, and secure all agentic tool interactions. Rather than acting as a standalone MCP server, the firewall acts as a **Security Gateway** that routes client requests to multiple, configured downstream MCP backend tools.
+
+### Key Capabilities
+
+1. **Multi-Server Routing**: Routes MCP connections seamlessly to downstream local endpoints based on queried targets (`/mcp/proxy/messages?server=name`).
+2. **`tools/call` Interception**: Inspects `arguments` provided to external tools and applies `BLOCK` or `REDACT` operations if secrets or PII are detected via `mcpScanner`.
+3. **Tool Result Interception**: Inspects the `result.content` returned from downstream tools (e.g., retrieving data from a database) and applies `BLOCK` or `REDACT` before the untrusted LLM ingests it.
+4. **`resources/read` Auditing**: Enforces the `file_scope` allowlist and blocklist ensuring `.env` and `*.pem` credentials cannot be read into the context window via MCP file browsing tools.
+5. **Tool Aggregation & Discovery**: Exposes aggregated tool capabilities using `/mcp/proxy/tools`.
 
 ---
 

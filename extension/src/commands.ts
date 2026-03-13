@@ -66,7 +66,12 @@ export function registerCommands(
     }),
 
     vscode.commands.registerCommand("aiFirewall.insertCode", (code: string) => {
-      const editor = vscode.window.activeTextEditor;
+      let editor = vscode.window.activeTextEditor;
+      if (!editor) {
+        // Fallback to the first visible editor if activeTextEditor is null (e.g. webview has focus)
+        editor = vscode.window.visibleTextEditors[0];
+      }
+
       if (!editor) {
         vscode.env.clipboard.writeText(code);
         vscode.window.showInformationMessage("Code copied to clipboard (no active editor).");
@@ -80,10 +85,16 @@ export function registerCommands(
           editBuilder.replace(editor.selection, code);
         }
       });
+      // Bring the editor back into focus
+      vscode.window.showTextDocument(editor.document, editor.viewColumn);
     }),
 
     vscode.commands.registerCommand("aiFirewall.replaceSelection", (code: string) => {
-      const editor = vscode.window.activeTextEditor;
+      let editor = vscode.window.activeTextEditor;
+      if (!editor) {
+        editor = vscode.window.visibleTextEditors[0];
+      }
+
       if (!editor || editor.selection.isEmpty) {
         vscode.env.clipboard.writeText(code);
         vscode.window.showInformationMessage("Code copied to clipboard.");
@@ -92,6 +103,7 @@ export function registerCommands(
       editor.edit((editBuilder) => {
         editBuilder.replace(editor.selection, code);
       });
+      vscode.window.showTextDocument(editor.document, editor.viewColumn);
     }),
 
     vscode.commands.registerCommand("aiFirewall.copyCode", (code: string) => {

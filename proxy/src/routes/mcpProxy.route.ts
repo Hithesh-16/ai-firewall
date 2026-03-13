@@ -389,16 +389,44 @@ export async function registerMcpProxyRoutes(app: FastifyInstance): Promise<void
    * Body: { serverName, toolName, arguments }
    */
   app.post("/mcp/proxy/call-tool", async (request: FastifyRequest, reply: FastifyReply) => {
-    const policy = loadPolicyConfig();
     const { serverName, toolName, arguments: toolArgs } = request.body as {
       serverName: string;
       toolName: string;
       arguments: Record<string, unknown>;
     };
 
+    const policy = loadPolicyConfig();
     const targetBase = resolveTargetBase(policy, serverName);
     if (!targetBase) {
       return reply.status(404).send({ error: `MCP server "${serverName}" not configured` });
+    }
+
+    // ── File Scope Enforcement ───────────────────────────────────────────
+    const fileRelatedTools = ["read_file", "read_text_file", "write_file", "edit_file", "create_directory", "list_directory", "list_directory_with_sizes", "directory_tree", "get_file_info", "search_files", "move_file"];
+    if (fileRelatedTools.includes(toolName) && policy.file_scope) {
+      const args = (toolArgs ?? {}) as Record<string, any>;
+      // Paths to check
+      const pathsToCheck: string[] = [];
+      if (args.path) pathsToCheck.push(args.path);
+      if (args.source) pathsToCheck.push(args.source);
+      if (args.destination) pathsToCheck.push(args.destination);
+      if (Array.isArray(args.paths)) pathsToCheck.push(...args.paths);
+
+      for (const p of pathsToCheck) {
+        const scopeResult = checkFileScope(p, policy.file_scope);
+        if (!scopeResult.allowed) {
+          logRequest({
+            timestamp: Date.now(), model: "mcp-tool-call", provider: serverName,
+            originalHash: hashText(JSON.stringify(toolArgs)), sanitizedText: "[BLOCKED]",
+            secretsFound: 0, piiFound: 0, filesBlocked: 1,
+            riskScore: 100, action: "BLOCK", reasons: [`AI Firewall blocked access to restricted path: ${p}`], responseTimeMs: 0
+          });
+          return reply.send({ 
+            content: [{ type: "text", text: `[AI Firewall blocked: ${scopeResult.reason ?? "Path is restricted"}]` }], 
+            isError: true 
+          });
+        }
+      }
     }
 
     // Scan arguments

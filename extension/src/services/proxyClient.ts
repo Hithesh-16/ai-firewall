@@ -29,8 +29,7 @@ function request(
     const payload = body ? JSON.stringify(body) : undefined;
     const auth = getAuthHeader();
     const headers: Record<string, string> = {
-      "Content-Type": "application/json",
-      ...(payload ? { "Content-Length": String(Buffer.byteLength(payload)) } : {}),
+      ...(payload ? { "Content-Type": "application/json", "Content-Length": String(Buffer.byteLength(payload)) } : {}),
       ...(auth ? { Authorization: auth } : {})
     };
 
@@ -108,6 +107,7 @@ export type ModelInfo = {
   outputCostPer1k: number;
   maxContextTokens: number;
   enabled: boolean;
+  registered: boolean;
 };
 
 export type CreditInfo = {
@@ -158,11 +158,13 @@ export async function estimate(
   messages: ChatMessage[],
   filePaths?: string[],
   projectRoot?: string,
-  bypassedFilePaths?: string[]
+  bypassedFilePaths?: string[],
+  tools?: OpenAiTool[]
 ): Promise<EstimateResult> {
   const res = await request("POST", "/api/estimate", {
     model,
     messages,
+    tools,
     metadata: filePaths || projectRoot || bypassedFilePaths?.length
       ? {
           ...(filePaths ? { filePaths } : {}),
@@ -493,6 +495,7 @@ export function streamChatCompletion(
     model,
     messages,
     stream: true,
+    tools,
     metadata:
       filePaths || projectRoot || bypassedFilePaths?.length
         ? {

@@ -27,13 +27,7 @@
       "**/node_modules/**",
       "**/dist/**",
       "**/.aifirewall-vault/**",
-      "docs",
-      "pnpm-lock.yaml",
-      "public",
-      "README.md",
-      "tsconfig.json",
-      "Hithesh_K_Resume.html",
-      "src"
+      "Hithesh_K_Resume.html"
     ],
     "allowlist": [],
     "max_file_size_kb": 500,
@@ -89,16 +83,8 @@
         "targetUrl": "http://localhost:3001"
       },
       {
-        "name": "database",
+        "name": "local-fs",
         "targetUrl": "http://localhost:3002"
-      },
-      {
-        "name": "git",
-        "targetUrl": "http://localhost:3003"
-      },
-      {
-        "name": "http://localhost:9999",
-        "targetUrl": "http://localhost:9999"
       }
     ]
   },

@@ -13,6 +13,7 @@ import {
   normalizeGeminiResponse,
   resolveGatewayRoute
 } from "../gateway/gatewayRouter";
+import { pipeUpstreamSSE, streamingHeaders } from "../gateway/sseStream";
 import { recordUsage } from "../gateway/usageService";
 import { logRequest } from "../logger/logger";
 import { evaluatePolicy } from "../policy/policyEngine";
@@ -315,17 +316,17 @@ export async function registerAiRoute(app: FastifyInstance): Promise<void> {
         if (gatewayRoute.isLocal) {
           requestPayload = formatOllamaPayload(
             gatewayRoute.model.modelName,
-            outboundMessages
+            outboundMessages,
+            wantsStream
           );
           if (wantsStream) {
-            // Stream from local Ollama and pipe to client
+            // Stream from local Ollama and pipe to client (identity encoding = no compression)
             const resp = await axios.post(gatewayRoute.providerUrl, requestPayload, {
-              headers,
+              headers: streamingHeaders(headers),
               responseType: "stream",
               timeout: 0
             });
-            reply.raw.writeHead(resp.status, resp.headers as any);
-            (resp.data as any).pipe(reply.raw);
+            await pipeUpstreamSSE(resp.data as NodeJS.ReadableStream, reply);
             return reply;
           } else {
             const resp = await axios.post(gatewayRoute.providerUrl, requestPayload, { headers, timeout: 120_000 });
@@ -345,17 +346,16 @@ export async function registerAiRoute(app: FastifyInstance): Promise<void> {
               input_schema: t.function?.parameters ?? t.input_schema ?? { type: "object", properties: {} }
             }));
           }
-          requestPayload = anthropicBase;
+          requestPayload = { ...anthropicBase, stream: wantsStream };
           headers["x-api-key"] = gatewayRoute.decryptedKey;
           headers["anthropic-version"] = "2023-06-01";
           if (wantsStream) {
             const resp = await axios.post(gatewayRoute.providerUrl, requestPayload, {
-              headers,
+              headers: streamingHeaders(headers),
               responseType: "stream",
               timeout: 0
             });
-            reply.raw.writeHead(resp.status, resp.headers as any);
-            (resp.data as any).pipe(reply.raw);
+            await pipeUpstreamSSE(resp.data as NodeJS.ReadableStream, reply);
             return reply;
           } else {
             const resp = await axios.post(gatewayRoute.providerUrl, requestPayload, { headers });
@@ -374,12 +374,15 @@ export async function registerAiRoute(app: FastifyInstance): Promise<void> {
               }))
             }];
           }
-          requestPayload = geminiBase;
+          requestPayload = { ...geminiBase, stream: wantsStream };
           const url = `${gatewayRoute.providerUrl}?key=${gatewayRoute.decryptedKey}`;
           if (wantsStream) {
-            const resp = await axios.post(url, requestPayload, { headers, responseType: "stream", timeout: 0 });
-            reply.raw.writeHead(resp.status, resp.headers as any);
-            (resp.data as any).pipe(reply.raw);
+            const resp = await axios.post(url, requestPayload, {
+              headers: streamingHeaders(headers),
+              responseType: "stream",
+              timeout: 0
+            });
+            await pipeUpstreamSSE(resp.data as NodeJS.ReadableStream, reply);
             return reply;
           } else {
             const resp = await axios.post(url, requestPayload, { headers });
@@ -391,14 +394,19 @@ export async function registerAiRoute(app: FastifyInstance): Promise<void> {
           requestPayload = {
             model: gatewayRoute.model.modelName,
             messages: outboundMessages,
+            stream: wantsStream,
             ...(inboundTools?.length ? { tools: inboundTools } : {}),
             ...(inboundToolChoice !== undefined ? { tool_choice: inboundToolChoice } : {})
           };
           headers["Authorization"] = `Bearer ${gatewayRoute.decryptedKey}`;
           if (wantsStream) {
-            const resp = await axios.post(gatewayRoute.providerUrl, requestPayload, { headers, responseType: "stream", timeout: 0 });
-            reply.raw.writeHead(resp.status, resp.headers as any);
-            (resp.data as any).pipe(reply.raw);
+            // Use identity encoding so the extension receives plain-text SSE, not gzip/br
+            const resp = await axios.post(gatewayRoute.providerUrl, requestPayload, {
+              headers: streamingHeaders(headers),
+              responseType: "stream",
+              timeout: 0
+            });
+            await pipeUpstreamSSE(resp.data as NodeJS.ReadableStream, reply);
             return reply;
           } else {
             const resp = await axios.post(gatewayRoute.providerUrl, requestPayload, { headers });

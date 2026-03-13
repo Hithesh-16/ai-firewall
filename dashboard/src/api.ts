@@ -169,3 +169,76 @@ export async function addModel(
 ): Promise<ModelInfo> {
   return post(`/api/providers/${providerId}/models`, { modelName, ...opts });
 }
+
+// --- Credits & Usage ---
+
+export type Credit = {
+  id: number;
+  providerId: number | null;
+  limitType: "requests" | "tokens" | "dollars";
+  totalLimit: number;
+  usedAmount: number;
+  resetPeriod: "daily" | "weekly" | "monthly";
+  resetDate: number;
+  hardLimit: boolean;
+};
+
+export type UsageSummary = {
+  totalRequests: number;
+  totalTokens: number;
+  totalCost: number;
+  byModel: Array<{ modelName: string; requests: number; tokens: number; cost: number }>;
+};
+
+export async function fetchCredits(providerId?: number): Promise<Credit[]> {
+  const params = providerId ? `?providerId=${providerId}` : "";
+  return get(`/api/credits${params}`);
+}
+
+export async function fetchUsageSummary(): Promise<UsageSummary> {
+  return get("/api/usage/summary");
+}
+
+// --- MCP Servers ---
+
+export type McpServer = {
+  name: string;
+  targetUrl: string;
+  online: boolean;
+};
+
+export async function fetchMcpServers(): Promise<McpServer[]> {
+  return get("/api/mcp/servers");
+}
+
+export async function addMcpServer(name: string, targetUrl: string): Promise<McpServer> {
+  return post("/api/mcp/servers", { name, targetUrl });
+}
+
+export async function deleteMcpServer(name: string): Promise<void> {
+  return del(`/api/mcp/servers/${name}`);
+}
+
+// --- Model Catalog ---
+
+export type CatalogModel = {
+  modelName: string;
+  displayName: string;
+  inputCostPer1k: number;
+  outputCostPer1k: number;
+  maxContextTokens: number;
+  tags?: string[];
+};
+
+export type CatalogProvider = {
+  name: string;
+  slug: string;
+  baseUrl: string;
+  authUrl: string;
+  description: string;
+  models: CatalogModel[];
+};
+
+export async function fetchModelCatalog(): Promise<CatalogProvider[]> {
+  return get("/api/models/catalog");
+}

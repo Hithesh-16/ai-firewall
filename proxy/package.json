@@ -9,6 +9,7 @@
     "build": "tsc -p tsconfig.json",
     "start": "node dist/server.js",
     "test:unit": "ts-node src/test/run-tests.ts",
+    "mcp-bridge": "ts-node tools/mcp-bridge.ts",
     "typecheck": "tsc --noEmit -p tsconfig.json"
   },
   "dependencies": {

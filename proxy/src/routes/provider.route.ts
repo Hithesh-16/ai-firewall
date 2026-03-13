@@ -288,7 +288,7 @@ export async function registerProviderRoutes(app: FastifyInstance): Promise<void
 
   app.delete(
     "/api/providers/:id",
-    { preHandler: [requireAuthOrLocalhost, requireRoleOnly("admin")] },
+    { preHandler: [requireAuthOrLocalhost, requireRoleOnly("admin", "security_lead", "developer")] },
     async (request, reply) => {
       const { id } = request.params as { id: string };
       const deleted = deleteProvider(Number(id));
@@ -311,9 +311,29 @@ export async function registerProviderRoutes(app: FastifyInstance): Promise<void
         return reply.status(404).send({ error: "Provider not found" });
       }
 
+      const slug = provider.slug.toLowerCase();
+      const isLocal = slug.includes("ollama") || slug === "local";
+
       const parsed = addModelSchema.safeParse(request.body);
       if (!parsed.success) {
         return reply.status(400).send({ error: "Invalid payload", details: parsed.error.flatten() });
+      }
+
+      // If not local, only allow models that exist in the global MODEL_CATALOG
+      if (!isLocal) {
+        const isKnownModel = MODEL_CATALOG.some(p =>
+          p.models.some(m => m.modelName === parsed.data.modelName)
+        );
+        if (!isKnownModel) {
+          return reply.status(403).send({ error: "Manual model creation is only allowed for local providers (like Ollama). For cloud providers, please select a model from the catalog." });
+        }
+      }
+
+      const allModels = listModels();
+      const duplicate = allModels.find((m) => m.modelName === parsed.data.modelName);
+      if (duplicate) {
+        const dupProvider = getProviderById(duplicate.providerId);
+        return reply.status(409).send({ error: `A model with the name "${parsed.data.modelName}" already exists on provider "${dupProvider?.name ?? "Unknown"}". Duplicate model names are not allowed.` });
       }
 
       try {
@@ -387,7 +407,7 @@ export async function registerProviderRoutes(app: FastifyInstance): Promise<void
 
   app.delete(
     "/api/models/:id",
-    { preHandler: [requireAuthOrLocalhost, requireRoleOnly("admin")] },
+    { preHandler: [requireAuthOrLocalhost, requireRoleOnly("admin", "security_lead", "developer")] },
     async (request, reply) => {
       const { id } = request.params as { id: string };
       const deleted = deleteModel(Number(id));

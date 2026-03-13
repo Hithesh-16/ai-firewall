@@ -5,8 +5,10 @@ import {
   addProvider,
   addModel,
   deleteProvider,
+  fetchModelCatalog,
   type ProviderInfo,
-  type ModelInfo
+  type ModelInfo,
+  type CatalogProvider
 } from "../api";
 
 const PRESETS = [
@@ -19,6 +21,7 @@ const PRESETS = [
 export default function Providers() {
   const [providers, setProviders] = useState<ProviderInfo[]>([]);
   const [models, setModels] = useState<ModelInfo[]>([]);
+  const [catalog, setCatalog] = useState<CatalogProvider[]>([]);
   const [err, setErr] = useState("");
   const [loading, setLoading] = useState(true);
 
@@ -34,10 +37,11 @@ export default function Providers() {
   function load() {
     setLoading(true);
     setErr("");
-    Promise.all([fetchProviders(), fetchModels()])
-      .then(([p, m]) => {
+    Promise.all([fetchProviders(), fetchModels(), fetchModelCatalog()])
+      .then(([p, m, c]) => {
         setProviders(p);
         setModels(m);
+        setCatalog(c);
         if (p.length > 0 && !modelProviderId) setModelProviderId(p[0].id);
       })
       .catch((e) => setErr(e.message))
@@ -70,16 +74,17 @@ export default function Providers() {
     }
   }
 
-  async function handleAddModel() {
-    if (!modelName.trim() || !modelProviderId) return;
+  async function handleAddModel(name?: string) {
+    const finalName = name || modelName.trim();
+    if (!finalName || !modelProviderId) return;
     setAddingModel(true);
     setErr("");
     try {
-      await addModel(modelProviderId, modelName.trim(), {
+      await addModel(modelProviderId, finalName, {
         inputCostPer1k: 0,
         outputCostPer1k: 0
       });
-      setModelName("");
+      if (!name) setModelName("");
       load();
     } catch (e) {
       setErr(e instanceof Error ? e.message : "Failed to add model");
@@ -106,11 +111,20 @@ export default function Providers() {
     models: models.filter((m) => m.providerId === p.id)
   }));
 
+  // Find models in catalog for selected provider
+  const selectedProvider = providers.find(p => p.id === modelProviderId);
+  const catalogModels = catalog.find(cp => 
+    selectedProvider && (selectedProvider.baseUrl === cp.baseUrl || selectedProvider.name.toLowerCase().includes(cp.slug.split('-')[0]))
+  )?.models || [];
+
+  const registeredModelNames = new Set(models.filter(m => m.providerId === modelProviderId).map(m => m.modelName));
+  const availableCatalogModels = catalogModels.filter(m => !registeredModelNames.has(m.modelName));
+
   return (
     <div>
       <h1 className="text-xl font-bold mb-6">Providers &amp; Models</h1>
       <p className="text-slate-400 text-sm mb-6">
-        Configure AI providers and models. Use Groq for free Llama. Then add models (e.g. llama-3.1-8b-instant for Groq).
+        Configure AI providers and models. Use Groq for free Llama. Then add models from the catalog or manually.
       </p>
 
       {err && <p className="text-red-400 text-sm mb-4">{err}</p>}
@@ -177,9 +191,9 @@ export default function Providers() {
           {providers.length === 0 ? (
             <p className="text-slate-500 text-sm">Add a provider first.</p>
           ) : (
-            <div className="space-y-3">
+            <div className="space-y-4">
               <div>
-                <label className="block text-xs text-slate-500 mb-1">Provider</label>
+                <label className="block text-xs text-slate-500 mb-1">1. Select Provider</label>
                 <select
                   value={modelProviderId}
                   onChange={(e) => setModelProviderId(Number(e.target.value))}
@@ -192,27 +206,53 @@ export default function Providers() {
                   ))}
                 </select>
               </div>
+
+              {availableCatalogModels.length > 0 && (
+                <div>
+                  <label className="block text-xs text-slate-500 mb-2">2a. Quick Add from Catalog</label>
+                  <div className="space-y-2 max-height-[200px] overflow-y-auto pr-1">
+                    {availableCatalogModels.map((cm) => (
+                      <div key={cm.modelName} className="flex items-center justify-between gap-3 p-2 bg-slate-800/50 rounded-lg border border-slate-800">
+                        <div>
+                          <div className="text-xs font-medium text-slate-200">{cm.displayName}</div>
+                          <div className="text-[10px] text-slate-500">{Math.round(cm.maxContextTokens/1000)}k ctx</div>
+                        </div>
+                        <button
+                          onClick={() => handleAddModel(cm.modelName)}
+                          disabled={addingModel}
+                          className="px-2 py-1 bg-slate-700 hover:bg-slate-600 text-slate-200 text-[10px] rounded transition-colors"
+                        >
+                          Add
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
               <div>
-                <label className="block text-xs text-slate-500 mb-1">Model name</label>
-                <input
-                  type="text"
-                  value={modelName}
-                  onChange={(e) => setModelName(e.target.value)}
-                  placeholder="e.g. llama-3.1-8b-instant, gpt-4"
-                  className="w-full px-3 py-2 bg-slate-800 border border-slate-700 rounded-lg text-sm text-white placeholder-slate-500 focus:outline-none focus:ring-1 focus:ring-blue-500"
-                />
+                <label className="block text-xs text-slate-500 mb-1">2b. Manual Entry</label>
+                <div className="flex gap-2">
+                  <input
+                    type="text"
+                    value={modelName}
+                    onChange={(e) => setModelName(e.target.value)}
+                    placeholder="e.g. llama-3.1-8b-instant"
+                    className="flex-1 px-3 py-2 bg-slate-800 border border-slate-700 rounded-lg text-sm text-white placeholder-slate-500 focus:outline-none focus:ring-1 focus:ring-blue-500"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => handleAddModel()}
+                    disabled={addingModel || !modelName.trim()}
+                    className="px-4 py-2 bg-blue-600 text-white text-sm rounded-lg hover:bg-blue-500 disabled:opacity-50 transition-colors"
+                  >
+                    {addingModel ? "..." : "Add"}
+                  </button>
+                </div>
+                <p className="text-[10px] text-slate-500 mt-2 leading-tight">
+                  For cloud providers, manual entry is only allowed for models already in our trusted catalog.
+                </p>
               </div>
-              <button
-                type="button"
-                onClick={handleAddModel}
-                disabled={addingModel || !modelName.trim()}
-                className="px-4 py-2 bg-blue-600 text-white text-sm rounded-lg hover:bg-blue-500 disabled:opacity-50 transition-colors"
-              >
-                {addingModel ? "Adding..." : "Add Model"}
-              </button>
-              <p className="text-xs text-slate-500 mt-2">
-                Groq: llama-3.1-8b-instant. OpenAI: gpt-4, gpt-3.5-turbo.
-              </p>
             </div>
           )}
         </div>
@@ -228,26 +268,28 @@ export default function Providers() {
               <div key={provider.id} className="bg-slate-900 border border-slate-800 rounded-xl p-4">
                 <div className="flex items-center justify-between mb-2">
                   <span className="font-medium text-slate-200">{provider.name}</span>
-                  <span className={`text-xs ${provider.enabled ? "text-green-400" : "text-slate-500"}`}>
-                    {provider.enabled ? "enabled" : "disabled"}
-                  </span>
-                  <button
-                    type="button"
-                    onClick={() => handleDeleteProvider(provider.id)}
-                    className="text-xs text-red-400 hover:text-red-300"
-                  >
-                    Delete
-                  </button>
+                  <div className="flex items-center gap-3">
+                    <span className={`text-[10px] uppercase tracking-wider ${provider.enabled ? "text-green-400" : "text-slate-500"}`}>
+                      {provider.enabled ? "enabled" : "disabled"}
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => handleDeleteProvider(provider.id)}
+                      className="text-[10px] text-red-500 hover:text-red-400 uppercase tracking-wider"
+                    >
+                      Delete
+                    </button>
+                  </div>
                 </div>
-                <p className="text-xs text-slate-500 mb-2">{provider.baseUrl}</p>
+                <p className="text-xs text-slate-500 mb-3 font-mono">{provider.baseUrl}</p>
                 <div className="flex flex-wrap gap-2">
                   {provModels.length === 0 ? (
-                    <span className="text-xs text-slate-500">No models</span>
+                    <span className="text-xs text-slate-500 italic">No models added yet</span>
                   ) : (
                     provModels.map((m) => (
                       <span
                         key={m.id}
-                        className="px-2 py-1 bg-slate-800 text-slate-300 text-xs rounded"
+                        className="px-2 py-1 bg-slate-800 border border-slate-700 text-slate-300 text-[10px] rounded"
                       >
                         {m.displayName || m.modelName}
                       </span>

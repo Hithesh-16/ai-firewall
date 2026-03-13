@@ -120,12 +120,13 @@ export function resolveRoute(
 
 export function formatOllamaPayload(
   model: string,
-  messages: Array<{ role: string; content: string }>
+  messages: Array<{ role: string; content: string }>,
+  stream = false
 ): unknown {
   return {
     model,
     messages,
-    stream: false
+    stream
   };
 }
 
